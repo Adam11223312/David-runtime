@@ -26,3 +26,4 @@ def enforce(req: EnforceRequest, authorization: str = Header(None)):
         return {"decision": "ALLOW", "rule_applied": "R-ALLOW-OUTPUT_TEXT"}
 
     return {"decision": "DENY", "rule_applied": "R-DENY-DEFAULT"}
+fix import formatting
