@@ -5,7 +5,10 @@ from datetime import datetime
 
 app = FastAPI()
 
-RUNTIME_KEY = os.getenv("DAVID_RUNTIME_KEY", "change_me")
+RUNTIME_KEY = os.getenv(RUNTIME_KEY = os.getenv("DAVID_RUNTIME_KEY")
+
+if not RUNTIME_KEY:
+    raise RuntimeError("DAVID_RUNTIME_KEY not set")
 
 class EnforceRequest(BaseModel):
     actor_id: str
