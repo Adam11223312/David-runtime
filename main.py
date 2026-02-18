@@ -5,7 +5,7 @@ import os
 
 app = FastAPI()
 
-RUNTIME_KEY = os.getenv("RUNTIME_KEY", "david_rt_93jf82hf92hf82hf82hfi238hf")
+RUNTIME_KEY = os.getenv("DAVID_RUNTIME_KEY")
 
 
 class EnforceRequest(BaseModel):
