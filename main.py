@@ -1,28 +1,25 @@
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+
+app = FastAPI()
+
+API_KEY = "david_rt_93jf82hf92hf82hf82hfi238hf"
+
+class EnforceRequest(BaseModel):
+    actor_id: str
+    action_type: str
+    payload: Dict[str, Any] = {}
+
 @app.post("/v1/enforce")
-def enforce(req: EnforceRequest, authorization: str = Header(None)):
+async def enforce(req: EnforceRequest, authorization: Optional[str] = Header(None)):
+    # AUTH
+    if authorization != f"Bearer {API_KEY}":
+        raise HTTPException(status_code=403, detail="DENY: bad or missing runtime key")
 
-    # ----- AUTHENTICATION -----
-    if authorization != f"Bearer {os.getenv('DAVID_RUNTIME_KEY')}":
-        raise HTTPException(status_code=403, detail="DENY: bad or missing key")
+    # Example allow rule
+    if req.actor_id == "admin" and req.action_type == "READ_STATUS":
+        return {"decision": "ALLOW", "rule_applied": "R-ADMIN-ALLOW-SAFE"}
 
-    # ----- AUTHORIZATION RULES -----
-
-    # Rule R-001: Only agent1 may OUTPUT_TEXT
-    if req.actor_id == "agent1" and req.action_type == "OUTPUT_TEXT":
-        return {
-            "decision": "ALLOW",
-            "rule_applied": "R-001-AGENT1-OUTPUT"
-        }
-
-    # Rule R-002: Block any EXECUTE_* actions completely
-    if req.action_type.startswith("EXECUTE"):
-        return {
-            "decision": "DENY",
-            "rule_applied": "R-002-NO-EXECUTION"
-        }
-
-    # ----- DEFAULT FAIL-CLOSED -----
-    return {
-        "decision": "DENY",
-        "rule_applied": "R-DENY-BY-DEFAULT"
-    }
+    # Default fail-closed
+    return {"decision": "DENY", "rule_applied": "R-DENY-BY-DEFAULT"}
