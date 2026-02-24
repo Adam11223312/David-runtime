@@ -1,0 +1,16 @@
+{
+  "rules": [
+    {
+      "rule_id": "R-OUTPUT-ALLOW",
+      "effect": "ALLOW",
+      "actor_id": "*",
+      "action_type": "OUTPUT_TEXT"
+    },
+    {
+      "rule_id": "R-ADMIN-ALLOW-SAFE",
+      "effect": "ALLOW",
+      "actor_id": "admin",
+      "action_type": "READ_STATUS"
+    }
+  ]
+}
