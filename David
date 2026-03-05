@@ -1,1 +1,13 @@
-User → AI Model → DAVID Gateway → Tool/API/System
+# --- Allow Safe Output Rule ---
+def allow_safe_output(request):
+    if request.get("action_type") == "OUTPUT_TEXT":
+        payload = request.get("payload", {})
+        text = payload.get("text", "")
+
+        if len(text) < 500:
+            return {
+                "decision": "ALLOW",
+                "rule_applied": "R-ALLOW-SAFE-OUTPUT"
+            }    return None
+
+    
