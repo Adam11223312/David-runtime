@@ -18,8 +18,14 @@ async def enforce(req: EnforceRequest, authorization: Optional[str] = Header(Non
         raise HTTPException(status_code=403, detail="DENY: bad or missing runtime key")
 
     # Example allow rule
-    if req.actor_id == "admin" and req.action_type == "READ_STATUS":
-        return {"decision": "ALLOW", "rule_applied": "R-ADMIN-ALLOW-SAFE"}
+# --- Allow Safe Output Rule ---
+if req.action_type == "OUTPUT_TEXT":
+    text = req.payload.get("text", "")
 
+    if len(text) < 500:
+        return {
+            "decision": "ALLOW",
+            "rule_applied": "R-ALLOW-SAFE-OUTPUT"
+        }
     # Default fail-closed
     return {"decision": "DENY", "rule_applied": "R-DENY-BY-DEFAULT"}
