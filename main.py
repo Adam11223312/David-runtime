@@ -28,8 +28,28 @@ async def enforce(req: EnforceRequest, authorization: Optional[str] = Header(Non
     rules = load_rules()
 
     for rule in rules.get("rules", []):
-        if rule.get("action_type") == req.action_type and rule.get("actor_id") in ("*", req.actor_id):
-
+        if (
+            rule.get("action_type") == req.action_type
+            and rule.get("actor_id") in ("*", req.actor_id)
+        ):
             if req.action_type == "OUTPUT_TEXT":
                 text = req.payload.get("text", "")
                 if len(text) <= rule.get("max_text_length", 500):
+                    return {
+                        "decision": rule.get("effect", "ALLOW"),
+                        "rule_applied": rule["rule_id"]
+                    }
+                return {
+                    "decision": "DENY",
+                    "rule_applied": "R-DENY-BY-DEFAULT"
+                }
+
+            return {
+                "decision": rule.get("effect", "ALLOW"),
+                "rule_applied": rule["rule_id"]
+            }
+
+    return {
+        "decision": "DENY",
+        "rule_applied": "R-DENY-BY-DEFAULT"
+    }
