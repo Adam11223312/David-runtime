@@ -32,4 +32,4 @@ async def enforce(req: EnforceRequest, authorization: Optional[str] = Header(Non
 
             if req.action_type == "OUTPUT_TEXT":
                 text = req.payload.get("text", "")
-                if len(text)
+                if len(text) <= rule.get("max_text_length", 500):
