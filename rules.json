@@ -1,16 +1,23 @@
 {
   "rules": [
     {
-      "rule_id": "R-OUTPUT-ALLOW",
+      "rule_id": "R-ALLOW-OUTPUT-TEXT",
       "effect": "ALLOW",
       "actor_id": "*",
-      "action_type": "OUTPUT_TEXT"
+      "action_type": "OUTPUT_TEXT",
+      "max_text_length": 500
     },
     {
-      "rule_id": "R-ADMIN-ALLOW-SAFE",
+      "rule_id": "R-ALLOW-READ-STATUS",
       "effect": "ALLOW",
-      "actor_id": "admin",
+      "actor_id": "*",
       "action_type": "READ_STATUS"
+    },
+    {
+      "rule_id": "R-REVIEW-BANK-TRANSFER",
+      "effect": "REVIEW",
+      "actor_id": "*",
+      "action_type": "BANK_TRANSFER"
     }
   ]
 }
