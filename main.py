@@ -10,7 +10,7 @@ import base64
 
 app = FastAPI()
 
-API_KEY = os.getenv("DAVID_API_KEY", "change_me_now")
+API_KEY = os.getenv("DAVID_adam_theone,"change_me_now")
 SIGNING_SECRET = os.getenv("DAVID_SIGNING_SECRET", "change_me_signing_secret_now")
 
 USED_NONCES = set()
