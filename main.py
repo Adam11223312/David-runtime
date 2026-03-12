@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header
+ fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import json
@@ -143,5 +143,4 @@ async def execute(req: ExecuteRequest, authorization: Optional[str] = Header(Non
         "decision": "EXECUTED",
         "request_id": token["request_id"],
         "action_type": token["action_type"],
-        "message": "Execution token accepted exactly once"
-    }
+        "
