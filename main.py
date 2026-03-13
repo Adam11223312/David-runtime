@@ -103,6 +103,27 @@ BLOCK_PATTERNS = [
     "drop table",
     "union select"
 ]
+
+DANGEROUS_TERM_GROUPS = [
+    ["ignore", "instructions"],
+    ["bypass", "security"],
+    ["disable", "security"],
+    ["reveal", "prompt"],
+    ["system", "prompt"],
+    ["developer", "instructions"],
+    ["ignore", "policy"],
+    ["remove", "restrictions"],
+    ["without", "restrictions"],
+    ["exfiltrate", "data"],
+    ["steal", "credentials"],
+    ["show", "api", "key"],
+    ["private", "key"],
+    ["execute", "command"],
+    ["run", "shell"],
+    ["privilege", "escalation"],
+    ["sql", "injection"]
+]
+
 BYPASS_VERBS = [
     "ignore",
     "bypass",
@@ -129,25 +150,6 @@ SAFETY_TERMS = [
     "filters",
     "controls",
     "guardrails"
-]
-DANGEROUS_TERM_GROUPS = [
-    ["ignore", "instructions"],
-    ["bypass", "security"],
-    ["disable", "security"],
-    ["reveal", "prompt"],
-    ["system", "prompt"],
-    ["developer", "instructions"],
-    ["ignore", "policy"],
-    ["remove", "restrictions"],
-    ["without", "restrictions"],
-    ["exfiltrate", "data"],
-    ["steal", "credentials"],
-    ["show", "api", "key"],
-    ["private", "key"],
-    ["execute", "command"],
-    ["run", "shell"],
-    ["privilege", "escalation"],
-    ["sql", "injection"]
 ]
 
 # ==============================
@@ -248,6 +250,29 @@ def detect_prompt_attack(prompt):
                 "reason": "DANGEROUS_TERM_COMBINATION",
                 "pattern": " ".join(normalized_group)
             }
+
+    return {"allow": True}
+
+def detect_semantic_bypass(prompt):
+    text = normalize_text(prompt or "")
+
+    if not text:
+        return {
+            "allow": False,
+            "reason": "EMPTY_PROMPT_FAIL_CLOSED"
+        }
+
+    for verb in BYPASS_VERBS:
+        verb_norm = normalize_text(verb)
+        if verb_norm in text:
+            for term in SAFETY_TERMS:
+                term_norm = normalize_text(term)
+                if term_norm in text:
+                    return {
+                        "allow": False,
+                        "reason": "SEMANTIC_BYPASS_DETECTED",
+                        "pattern": f"{verb_norm} + {term_norm}"
+                    }
 
     return {"allow": True}
 
@@ -430,6 +455,27 @@ def enforce(req: Request, authorization: str | None = Header(default=None)):
         write_audit_event(req.model_dump(), attack_check)
         raise HTTPException(status_code=403, detail=attack_check)
 
+    semantic_check = detect_semantic_bypass(req.prompt)
+    if not semantic_check["allow"]:
+        write_audit_event(req.model_dump(), semantic_check)
+        raise HTTPException(status_code=403, detail=semantic_check)
+
     anomaly_check = detect_anomaly(req.actor, req.action, req.prompt)
     if not anomaly_check["allow"]:
-        write_audit
+        write_audit_event(req.model_dump(), anomaly_check)
+        raise HTTPException(status_code=429, detail=anomaly_check)
+
+    decision = evaluate_policy(req)
+    if not decision["allow"]:
+        write_audit_event(req.model_dump(), decision)
+        raise HTTPException(status_code=403, detail=decision)
+
+    result = {
+        "status": "allowed",
+        "message": "Request passed David enforcement",
+        "model": req.model,
+        "tool": req.tool
+    }
+
+    write_audit_event(req.model_dump(), result)
+    return result
