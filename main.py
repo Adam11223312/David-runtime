@@ -103,7 +103,33 @@ BLOCK_PATTERNS = [
     "drop table",
     "union select"
 ]
+BYPASS_VERBS = [
+    "ignore",
+    "bypass",
+    "disable",
+    "remove",
+    "override",
+    "evade",
+    "skip",
+    "avoid",
+    "circumvent",
+    "set aside",
+    "disregard",
+    "forget"
+]
 
+SAFETY_TERMS = [
+    "safety",
+    "rules",
+    "policy",
+    "policies",
+    "safeguards",
+    "framework",
+    "restrictions",
+    "filters",
+    "controls",
+    "guardrails"
+]
 DANGEROUS_TERM_GROUPS = [
     ["ignore", "instructions"],
     ["bypass", "security"],
