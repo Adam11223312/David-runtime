@@ -1,4 +1,92 @@
-from fastapi import FastAPI, Request, HTTPException
+fromfrom fastapi import FastAPI, Request, HTTPException
+import os
+import re
+
+app = FastAPI()
+
+# API key from Railway environment variables
+API_KEY = os.getenv("API_KEY")
+
+
+# Attack patterns David should block
+BLOCK_PATTERNS = [
+
+    # prompt injection
+    r"ignore previous instructions",
+    r"reveal system prompt",
+    r"show system prompt",
+    r"print system prompt",
+
+    # secret extraction
+    r"show.*api key",
+    r"reveal.*api key",
+    r"print.*api key",
+    r"give.*api key",
+    r"what.*api key",
+    r"tell.*api key",
+
+    r"show.*secret",
+    r"reveal.*secret",
+    r"print.*secret",
+
+    r"show.*password",
+    r"reveal.*password",
+
+    r"show.*token",
+    r"reveal.*token",
+
+    # jailbreak attempts
+    r"forget your rules",
+    r"act as unrestricted",
+    r"pretend you are not restricted",
+    r"developer mode",
+    r"jailbreak",
+    r"bypass safety",
+
+    # malicious requests
+    r"provide malware",
+    r"write ransomware",
+    r"make a phishing email",
+    r"bank password",
+    r"social security number",
+    r"credit card dump"
+]
+
+
+def detect_attack(text: str):
+    text = text.lower()
+
+    for pattern in BLOCK_PATTERNS:
+        if re.search(pattern, text):
+            return True
+
+    return False
+
+
+@app.post("/v1/enforce")
+async def enforce(request: Request):
+
+    # Authentication check
+    auth = request.headers.get("Authorization")
+
+    if not auth or auth != f"Bearer {API_KEY}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Get request body
+    body = await request.json()
+    user_input = body.get("input", "")
+
+    # Detect attack
+    if detect_attack(user_input):
+        return {
+            "decision": "BLOCK",
+            "reason": "Matched block pattern"
+        }
+
+    return {
+        "decision": "ALLOW",
+        "reason": "Input passed security rules"
+    } fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
@@ -237,22 +325,4 @@ async def enforce(req: EnforcementRequest, request: Request):
 
     # Repeat attacker lockout
     if is_repeat_attacker(ip):
-        audit_event(ip, "DENY", "Repeated malicious behavior", req.input, 403)
-        raise HTTPException(status_code=403, detail="Access temporarily blocked")
-
-    # Content inspection
-    should_block, reason = detect_block(req.input)
-    if should_block:
-        record_blocked_attempt(ip)
-        audit_event(ip, "BLOCK", reason, req.input, 200)
-        return {
-            "decision": "BLOCK",
-            "reason": reason
-        }
-
-    # Default allow
-    audit_event(ip, "ALLOW", "Input passed policy checks", req.input, 200)
-    return {
-        "decision": "ALLOW",
-        "reason": "Input passed policy checks"
-    }
+        audit_
