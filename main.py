@@ -1,155 +1,248 @@
-r"show.*secret",
-    r"reveal.*secret",
-    r"print.*secret",
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+import hashlib
+import json
+import os
+import time
+import hmac
+from collections import defaultdict
 
-    r"show.*password",
-    r"reveal.*password",
-    r"give.*password",
+app = FastAPI(title="DAVID Runtime")
 
-    r"show.*token",
-    r"reveal.*token",
-]
+# ==============================
+# CONFIG
+# ==============================
+
+API_KEY = os.getenv("DAVID_API_KEY", "test123")
+POLICY_SECRET = os.getenv("DAVID_POLICY_SECRET", "change_this_secret")
+AUDIT_FILE = "audit.log"
+
+ALLOWED_MODELS = {
+    "gpt-4o-mini",
+    "gpt-4.1",
+    "deepseek-chat",
+    "claude-3-5-sonnet"
+}
+
 BLOCK_PATTERNS = [
-    r"ignore previous instructions",
-    r"reveal system prompt",
-    r"show system prompt",
-
-    # secret extraction
-    r"show.*api key",
-    r"reveal.*api key",
-    r"print.*api key",
-    r"give.*api key",
-    r"what.*api key",
-    r"tell.*api key",
-
-    r"show.*secret",
-    r"reveal.*secret",
-    r"print.*secret",
-
-    r"show.*password",
-    r"reveal.*password",
-    r"give.*password",
-
-    r"show.*token",
-    r"reveal.*token",
-]
-SUSPICIOUS_PATTERNS = [
-    r"base64",
-    r"unicode bypass",
-    r"hex encoded",
-    r"encoded payload",
-    r"hidden instructions",
-    r"nested prompt",
-    r"ignore the above and",
+    "ignore previous instructions",
+    "bypass security",
+    "disable security",
+    "reveal system prompt",
+    "override david",
+    "ignore david",
+    "jailbreak",
 ]
 
-def normalize_text(text: str) -> str:
-    return text.lower().strip()
+ALLOWED_ACTIONS = [
+    "model:invoke",
+    "email:create_draft"
+]
 
-def detect_block(text: str) -> tuple[bool, str]:
-    normalized = normalize_text(text)
+REQUEST_LOG = defaultdict(list)
+
+MAX_REQUESTS_PER_MINUTE = 20
+MAX_PROMPT_LENGTH = 4000
+
+
+# ==============================
+# REQUEST MODEL
+# ==============================
+
+class Request(BaseModel):
+    actor: str
+    action: str
+    tool: Optional[str] = None
+    model: Optional[str] = None
+    prompt: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+# ==============================
+# AUTH
+# ==============================
+
+def verify_token(header):
+
+    if not header:
+        return None
+
+    if not header.startswith("Bearer "):
+        return None
+
+    token = header.split(" ")[1]
+
+    if token == API_KEY:
+        return {"actor":"authorized"}
+
+    return None
+
+
+# ==============================
+# PROMPT ATTACK DETECTION
+# ==============================
+
+def detect_prompt_attack(prompt):
+
+    text = (prompt or "").lower()
 
     for pattern in BLOCK_PATTERNS:
-        if re.search(pattern, normalized):
-            return True, f"Matched block pattern: {pattern}"
+        if pattern in text:
+            return {
+                "allow": False,
+                "reason": "PROMPT_ATTACK_DETECTED",
+                "pattern": pattern
+            }
 
-    for pattern in SUSPICIOUS_PATTERNS:
-        if re.search(pattern, normalized):
-            return True, f"Matched suspicious pattern: {pattern}"
+    return {"allow": True}
 
-    return False, "No blocked pattern matched"
 
-# =========================
-# HELPERS
-# =========================
-def get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
+# ==============================
+# ANOMALY DETECTION
+# ==============================
 
-def is_rate_limited(ip: str) -> bool:
-    now = datetime.utcnow()
-    window_start = now - timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
+def detect_anomaly(actor, action, prompt):
 
-    while request_log[ip] and request_log[ip][0] < window_start:
-        request_log[ip].popleft()
+    now = time.time()
+    key = f"{actor}:{action}"
 
-    return len(request_log[ip]) >= RATE_LIMIT_REQUESTS
+    REQUEST_LOG[key] = [t for t in REQUEST_LOG[key] if now - t < 60]
+    REQUEST_LOG[key].append(now)
 
-def record_request(ip: str) -> None:
-    request_log[ip].append(datetime.utcnow())
+    if len(REQUEST_LOG[key]) > MAX_REQUESTS_PER_MINUTE:
+        return {
+            "allow": False,
+            "reason": "RATE_LIMIT_EXCEEDED"
+        }
 
-def record_blocked_attempt(ip: str) -> None:
-    now = datetime.utcnow()
-    blocked_attempts[ip].append(now)
+    if len(prompt or "") > MAX_PROMPT_LENGTH:
+        return {
+            "allow": False,
+            "reason": "PROMPT_TOO_LARGE"
+        }
 
-    window_start = now - timedelta(minutes=BLOCK_WINDOW_MINUTES)
-    while blocked_attempts[ip] and blocked_attempts[ip][0] < window_start:
-        blocked_attempts[ip].popleft()
+    return {"allow": True}
 
-def is_repeat_attacker(ip: str) -> bool:
-    now = datetime.utcnow()
-    window_start = now - timedelta(minutes=BLOCK_WINDOW_MINUTES)
 
-    while blocked_attempts[ip] and blocked_attempts[ip][0] < window_start:
-        blocked_attempts[ip].popleft()
+# ==============================
+# MODEL CONTROL
+# ==============================
 
-    return len(blocked_attempts[ip]) >= BLOCK_THRESHOLD
+def enforce_model_allowlist(model):
 
-def write_audit_log(entry: dict) -> None:
-    AUDIT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with AUDIT_LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+    if model not in ALLOWED_MODELS:
+        return {
+            "allow": False,
+            "reason": "MODEL_NOT_ALLOWED"
+        }
 
-def audit_event(
-    ip: str,
-    decision: str,
-    reason: str,
-    user_input: str,
-    status_code: int
-) -> None:
-    entry = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "ip": ip,
-        "decision": decision,
-        "reason": reason,
-        "status_code": status_code,
-        "input_preview": user_input[:300]
+    return {"allow": True}
+
+
+# ==============================
+# POLICY ENGINE
+# ==============================
+
+def evaluate_policy(req):
+
+    if req.action not in ALLOWED_ACTIONS:
+        return {
+            "allow": False,
+            "reason": "ACTION_NOT_ALLOWED"
+        }
+
+    return {
+        "allow": True
     }
-    write_audit_log(entry)
 
-# =========================
-# ENDPOINTS
-# =========================
+
+# ==============================
+# AUDIT CHAIN
+# ==============================
+
+def last_hash():
+
+    if not os.path.exists(AUDIT_FILE):
+        return "GENESIS"
+
+    with open(AUDIT_FILE,"r") as f:
+        lines = f.readlines()
+
+    if not lines:
+        return "GENESIS"
+
+    last = json.loads(lines[-1])
+
+    return last["hash"]
+
+
+def write_audit_event(request, decision):
+
+    prev = last_hash()
+
+    event = {
+        "time": int(time.time()),
+        "request": request,
+        "decision": decision,
+        "prev_hash": prev
+    }
+
+    raw = json.dumps(event,sort_keys=True).encode()
+
+    event_hash = hashlib.sha256(raw).hexdigest()
+
+    event["hash"] = event_hash
+
+    with open(AUDIT_FILE,"a") as f:
+        f.write(json.dumps(event)+"\n")
+
+
+# ==============================
+# API ENDPOINT
+# ==============================
+
 @app.get("/")
 def root():
-    return {"status": "David runtime online"}
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "service": "David Runtime",
-        "version": "2.0",
-        "fail_closed": True,
-        "audit_log": str(AUDIT_LOG_FILE)
-    }
+    return {"status":"DAVID running"}
 
 @app.post("/v1/enforce")
-async def enforce(req: EnforcementRequest, request: Request):
-    ip = get_client_ip(request)
-    record_request(ip)
+def enforce(req: Request, authorization: str | None = Header(default=None)):
 
-    auth = request.headers.get("authorization", "")
+    actor = verify_token(authorization)
 
-    # Auth check
-    if auth != f"Bearer {API_KEY}":
-        audit_event(ip, "DENY", "Unauthorized", req.input, 401)
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not actor:
+        decision = {"allow":False,"reason":"AUTH_FAILED"}
+        write_audit_event(req.dict(), decision)
+        raise HTTPException(status_code=401, detail=decision)
 
-    # Rate limiting
-    if is_rate_limited(ip):
-        audit_event(ip, "DENY", "R
+    attack = detect_prompt_attack(req.prompt)
+    if not attack["allow"]:
+        write_audit_event(req.dict(), attack)
+        raise HTTPException(status_code=403, detail=attack)
+
+    anomaly = detect_anomaly(req.actor, req.action, req.prompt)
+    if not anomaly["allow"]:
+        write_audit_event(req.dict(), anomaly)
+        raise HTTPException(status_code=429, detail=anomaly)
+
+    model_check = enforce_model_allowlist(req.model)
+    if not model_check["allow"]:
+        write_audit_event(req.dict(), model_check)
+        raise HTTPException(status_code=403, detail=model_check)
+
+    decision = evaluate_policy(req)
+
+    if not decision["allow"]:
+        write_audit_event(req.dict(), decision)
+        raise HTTPException(status_code=403, detail=decision)
+
+    result = {
+        "status":"allowed",
+        "message":"Request passed David enforcement",
+        "model": req.model
+    }
+
+    write_audit_event(req.dict(), result)
+
+    return result
