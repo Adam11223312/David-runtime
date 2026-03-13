@@ -65,8 +65,7 @@ BLOCK_PATTERNS = [
     r"make a phishing email",
     r"bank password",
     r"social security number",
-    r"credit card dump",
-]BLOCK_PATTERNS = [
+    r"credit card dump",[
     r"ignore previous instructions",
     r"reveal system prompt",
     r"show system prompt",
