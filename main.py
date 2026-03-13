@@ -323,6 +323,3 @@ async def enforce(req: EnforcementRequest, request: Request):
         audit_event(ip, "DENY", "Rate limit exceeded", req.input, 429)
         raise HTTPException(status_code=429, detail="Too many requests")
 
-    # Repeat attacker lockout
-    if is_repeat_attacker(ip):
-        audit_
