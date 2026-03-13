@@ -66,8 +66,54 @@ BLOCK_PATTERNS = [
     r"bank password",
     r"social security number",
     r"credit card dump",
-]
+]BLOCK_PATTERNS = [
+    r"ignore previous instructions",
+    r"reveal system prompt",
+    r"show system prompt",
 
+    # secret extraction
+    r"show.*api key",
+    r"reveal.*api key",
+    r"print.*api key",
+    r"give.*api key",
+    r"what.*api key",
+    r"tell.*api key",
+
+    r"show.*secret",
+    r"reveal.*secret",
+    r"print.*secret",
+
+    r"show.*password",
+    r"reveal.*password",
+    r"give.*password",
+
+    r"show.*token",
+    r"reveal.*token",
+]
+BLOCK_PATTERNS = [
+    r"ignore previous instructions",
+    r"reveal system prompt",
+    r"show system prompt",
+
+    # secret extraction
+    r"show.*api key",
+    r"reveal.*api key",
+    r"print.*api key",
+    r"give.*api key",
+    r"what.*api key",
+    r"tell.*api key",
+
+    r"show.*secret",
+    r"reveal.*secret",
+    r"print.*secret",
+
+    r"show.*password",
+    r"reveal.*password",
+    r"give.*password",
+
+    r"show.*token",
+    r"reveal.*token",
+]
 SUSPICIOUS_PATTERNS = [
     r"base64",
     r"unicode bypass",
