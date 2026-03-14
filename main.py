@@ -1,40 +1,6 @@
  fastapi import FastAPI, Request
-import time
-import hashlib
-import re
-import unicodedata
-from collections import defaultdict
-
-app = FastAPI()
-
-# -------------------------
-# CONFIG
-# -------------------------
-
-RATE_LIMIT = 50
-RATE_WINDOW = 60
-
-request_log = defaultdict(list)
-
-# -------------------------
-# RULE SETS
-# -------------------------
-
-ALLOW_RULES = [
-    "normal query",
-    "status check",
-    "help",
-]
-
-DENY_RULES = [
-    "delete database",
-    "shutdown system",
-]
-
-BLOCK_RULES = [
-    "ignore previous instructions",
-    "bypass security",
-    "override system",
+ time
+import     "override system",
     "disable safety",
 ]
 
@@ -169,5 +135,3 @@ async def enforce_request(request: Request):
         decision = "BLOCK_RATE_LIMIT"
 
         audit_log(ip, text, decision)
-
-        return {"decision": decision}
