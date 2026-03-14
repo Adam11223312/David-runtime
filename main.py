@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+ fastapi import FastAPI, Request
 import time
 import hashlib
 import re
@@ -171,12 +171,3 @@ async def enforce_request(request: Request):
         audit_log(ip, text, decision)
 
         return {"decision": decision}
-
-    decision = enforce(text)
-
-    audit_log(ip, text, decision)
-
-    return {
-        "decision": decision,
-        "code_hash": CODE_HASH
-    }
