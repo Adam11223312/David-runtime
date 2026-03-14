@@ -1,19 +1,53 @@
-fastapi import FastAPI, Request
- time
-import     "override system",
-    "disable safety",
+from fastapi import FastAPI, Request
+import time
+import hashlib
+import re
+import unicodedata
+from collections import defaultdict
+
+app = FastAPI()
+
+# -------------------------
+# CONFIG
+# -------------------------
+
+RATE_LIMIT = 50
+RATE_WINDOW = 60
+
+request_log = defaultdict(list)
+
+# -------------------------
+# RULE SETS
+# -------------------------
+
+ALLOW_RULES = [
+    "help",
+    "status check",
+    "normal query"
+]
+
+DENY_RULES = [
+    "delete database",
+    "shutdown system"
+]
+
+BLOCK_RULES = [
+    "ignore previous instructions",
+    "bypass security",
+    "override system",
+    "disable safety"
 ]
 
 SIGNATURES = [
     "act as admin",
-    "pretend rules don't exist",
-    "system override",
+    "pretend rules dont exist",
+    "system override"
 ]
 
 PHRASE_MAP = {
     "bend rules": "bypass security",
     "ignore rules": "bypass security",
-    "override": "bypass security",
+    "override rules": "bypass security"
 }
 
 # -------------------------
@@ -26,8 +60,23 @@ def normalize(text: str):
 
     text = unicodedata.normalize("NFKD", text)
 
-    text = re.sub(r'[^\w\s]', '', text)
+    # leetspeak conversion
+    leet_map = {
+        "0": "o",
+        "1": "i",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "7": "t"
+    }
 
+    for k, v in leet_map.items():
+        text = text.replace(k, v)
+
+    # remove punctuation / emojis
+    text = re.sub(r"[^\w\s]", "", text)
+
+    # phrase mapping
     for phrase in PHRASE_MAP:
         if phrase in text:
             text = text.replace(phrase, PHRASE_MAP[phrase])
@@ -44,7 +93,7 @@ def rate_limited(ip):
 
     request_log[ip] = [t for t in request_log[ip] if now - t < RATE_WINDOW]
 
-    if len(request_log[ip]) > RATE_LIMIT:
+    if len(request_log[ip]) >= RATE_LIMIT:
         return True
 
     request_log[ip].append(now)
@@ -78,15 +127,10 @@ def audit_log(user, request_text, decision):
 def self_integrity():
 
     try:
-
         with open(__file__, "rb") as f:
-
             code = f.read()
-
             return hashlib.sha256(code).hexdigest()
-
     except:
-
         return "unknown"
 
 CODE_HASH = self_integrity()
@@ -99,22 +143,27 @@ def enforce(text):
 
     normalized = normalize(text)
 
+    # block rules
     for rule in BLOCK_RULES:
         if rule in normalized:
             return "BLOCK"
 
+    # deny rules
     for rule in DENY_RULES:
         if rule in normalized:
             return "DENY"
 
+    # signature detection
     for sig in SIGNATURES:
         if sig in normalized:
             return "BLOCK"
 
+    # allow rules
     for rule in ALLOW_RULES:
         if rule in normalized:
             return "ALLOW"
 
+    # fail closed
     return "FAIL_CLOSED"
 
 # -------------------------
@@ -135,3 +184,14 @@ async def enforce_request(request: Request):
         decision = "BLOCK_RATE_LIMIT"
 
         audit_log(ip, text, decision)
+
+        return {"decision": decision}
+
+    decision = enforce(text)
+
+    audit_log(ip, text, decision)
+
+    return {
+        "decision": decision,
+        "code_hash": CODE_HASH
+    }
