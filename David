@@ -1,13 +1,202 @@
-# --- Allow Safe Output Rule ---
-def allow_safe_output(request):
-    if request.get("action_type") == "OUTPUT_TEXT":
-        payload = request.get("payload", {})
-        text = payload.get("text", "")
+from fastapi import FastAPI, Request, HTTPException
+from datetime import datetime, timedelta
+import hashlib
+import uuid
 
-        if len(text) < 500:
-            return {
-                "decision": "ALLOW",
-                "rule_applied": "R-ALLOW-SAFE-OUTPUT"
-            }    return None
+app = FastAPI()
 
-    
+# =========================
+# CONFIG
+# =========================
+
+VALID_TOKENS = {
+    "david_rt_93jf82hf92hf82hf82hfi238hf": {
+        "role": "admin",
+        "expires": datetime.utcnow() + timedelta(hours=12)
+    }
+}
+
+USED_TOKENS = set()
+
+ALLOW_ACTIONS = {
+    "read",
+    "analyze"
+}
+
+SENSITIVE_ACTIONS = {
+    "transfer",
+    "write",
+    "external_call",
+    "admin"
+}
+
+DENY_PATTERNS = [
+    "bypass",
+    "ignore previous",
+    "override",
+    "system prompt",
+    "hack",
+    "exploit",
+    "inject",
+    "jailbreak"
+]
+
+# =========================
+# HEALTH / DEBUG ROUTES
+# =========================
+
+@app.get("/")
+async def root():
+    return {"status": "David live"}
+
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "service": "David",
+        "route": "/david",
+        "time": datetime.utcnow().isoformat()
+    }
+
+# =========================
+# HELPERS
+# =========================
+
+def hash_request(data: str):
+    return hashlib.sha256(data.encode()).hexdigest()
+
+def detect_anomaly(text: str):
+    text = text.lower()
+    for pattern in DENY_PATTERNS:
+        if pattern in text:
+            return True, f"DENY_PATTERN:{pattern}"
+    return False, None
+
+def validate_token(token: str):
+    if token in USED_TOKENS:
+        return False, "TOKEN_ALREADY_USED"
+
+    data = VALID_TOKENS.get(token)
+    if not data:
+        return False, "INVALID_TOKEN"
+
+    if datetime.utcnow() > data["expires"]:
+        return False, "TOKEN_EXPIRED"
+
+    return True, data
+
+def mark_token_used(token: str):
+    USED_TOKENS.add(token)
+
+def require_dual_approval(headers):
+    local = headers.get("X-Local-Approval")
+    remote = headers.get("X-Remote-Approval")
+    return local == "approved" and remote == "approved"
+
+def risk_score(action, anomaly):
+    score = 0
+    if action in SENSITIVE_ACTIONS:
+        score += 50
+    if anomaly:
+        score += 40
+    return min(score, 100)
+
+def log_event(entry: dict):
+    print({
+        "timestamp": datetime.utcnow().isoformat(),
+        **entry
+    })
+
+# =========================
+# MAIN ENDPOINT
+# =========================
+
+@app.post("/david")
+async def david(request: Request):
+
+    body = await request.json()
+    headers = request.headers
+
+    request_text = str(body)
+    action = body.get("action", "unknown")
+
+    # =========================
+    # AUTHORIZATION
+    # =========================
+
+    auth_header = headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        log_event({"decision": "DENY", "reason": "MISSING_AUTH"})
+        raise HTTPException(status_code=403, detail="DENY: MISSING_AUTH")
+
+    token = auth_header.split(" ")[1]
+
+    valid, token_data = validate_token(token)
+    if not valid:
+        log_event({"decision": "DENY", "reason": token_data})
+        raise HTTPException(status_code=403, detail=f"DENY: {token_data}")
+
+    role = token_data["role"]
+
+    # =========================
+    # ANOMALY DETECTION
+    # =========================
+
+    anomaly, anomaly_reason = detect_anomaly(request_text)
+
+    # =========================
+    # ACTION CONTROL
+    # =========================
+
+    if action not in ALLOW_ACTIONS and action not in SENSITIVE_ACTIONS:
+        log_event({"decision": "DENY", "reason": "UNKNOWN_ACTION"})
+        raise HTTPException(status_code=403, detail="DENY: UNKNOWN_ACTION")
+
+    # =========================
+    # DUAL APPROVAL CHECK
+    # =========================
+
+    if action in SENSITIVE_ACTIONS:
+        if not require_dual_approval(headers):
+            log_event({"decision": "DENY", "reason": "DUAL_APPROVAL_REQUIRED"})
+            raise HTTPException(status_code=403, detail="DENY: DUAL_APPROVAL_REQUIRED")
+
+    # =========================
+    # ANOMALY BLOCK
+    # =========================
+
+    if anomaly:
+        log_event({"decision": "DENY", "reason": anomaly_reason})
+        raise HTTPException(status_code=403, detail=f"DENY: {anomaly_reason}")
+
+    # =========================
+    # FAIL CLOSED DEFAULT
+    # =========================
+
+    if action not in ALLOW_ACTIONS and action not in SENSITIVE_ACTIONS:
+        log_event({"decision": "DENY", "reason": "FAIL_CLOSED"})
+        raise HTTPException(status_code=403, detail="DENY: FAIL_CLOSED")
+
+    # =========================
+    # MARK TOKEN USED
+    # =========================
+
+    mark_token_used(token)
+
+    # =========================
+    # RISK + RESPONSE
+    # =========================
+
+    score = risk_score(action, anomaly)
+
+    decision = {
+        "decision": "ALLOW",
+        "action": action,
+        "role": role,
+        "risk_score": score,
+        "request_id": str(uuid.uuid4())
+    }
+
+    log_event(decision)
+
+    return decision
