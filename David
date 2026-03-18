@@ -11,11 +11,11 @@ app = FastAPI()
 # =========================
 
 VALID_TOKENS = {
-    "david_rt_93jf82hf92hf82hf82hfi238hf": {
+    "david_rt_fresh1": {
         "role": "admin",
         "expires": datetime.utcnow() + timedelta(hours=12)
     },
-    "david_rt_fresh1": {
+    "david_rt_test1": {
         "role": "admin",
         "expires": datetime.utcnow() + timedelta(hours=12)
     },
