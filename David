@@ -1,7 +1,8 @@
 from fastapi import FastAPI, Request, HTTPException
 from datetime import datetime, timedelta
-import hashlib
+import re
 import uuid
+import unicodedata
 
 app = FastAPI()
 
@@ -11,6 +12,14 @@ app = FastAPI()
 
 VALID_TOKENS = {
     "david_rt_93jf82hf92hf82hf82hfi238hf": {
+        "role": "admin",
+        "expires": datetime.utcnow() + timedelta(hours=12)
+    },
+    "david_rt_test2": {
+        "role": "admin",
+        "expires": datetime.utcnow() + timedelta(hours=12)
+    },
+    "david_rt_test3": {
         "role": "admin",
         "expires": datetime.utcnow() + timedelta(hours=12)
     }
@@ -38,7 +47,34 @@ DENY_PATTERNS = [
     "hack",
     "exploit",
     "inject",
-    "jailbreak"
+    "jailbreak",
+    "do not follow prior rules",
+    "act as admin",
+    "grant full access",
+    "disable security",
+    "ignore instructions",
+    "ignore all instructions",
+    "ignore the rules",
+    "without restrictions",
+    "remove restrictions",
+    "skip authorization",
+    "skip auth",
+    "elevate privileges",
+    "privilege escalation",
+    "full access",
+]
+
+DANGEROUS_GROUPS = [
+    ["ignore", "instruction"],
+    ["ignore", "rule"],
+    ["bypass", "security"],
+    ["act", "admin"],
+    ["grant", "access"],
+    ["full", "access"],
+    ["disable", "security"],
+    ["skip", "authorization"],
+    ["skip", "auth"],
+    ["elevate", "privilege"],
 ]
 
 # =========================
@@ -58,18 +94,78 @@ async def health():
         "time": datetime.utcnow().isoformat()
     }
 
+@app.get("/pingdavid")
+async def pingdavid():
+    return {"ping": "david-live"}
+
 # =========================
 # HELPERS
 # =========================
 
-def hash_request(data: str):
-    return hashlib.sha256(data.encode()).hexdigest()
+def log_event(entry: dict):
+    print({
+        "timestamp": datetime.utcnow().isoformat(),
+        **entry
+    })
+
+def strip_accents(text: str) -> str:
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(ch)
+    )
+
+def normalize_text(text: str) -> str:
+    """
+    Magic normalization:
+    - lowercase
+    - strip accents
+    - convert common leetspeak
+    - remove symbol noise
+    - collapse spaces
+    """
+    text = strip_accents(text.lower())
+
+    replacements = {
+        "0": "o",
+        "1": "i",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "6": "g",
+        "7": "t",
+        "8": "b",
+        "9": "g",
+        "@": "a",
+        "$": "s",
+        "!": "i",
+        "|": "i",
+        "+": "t",
+    }
+
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def group_match(normalized: str) -> str | None:
+    for group in DANGEROUS_GROUPS:
+        if all(word in normalized for word in group):
+            return f"DENY_GROUP:{'_'.join(group)}"
+    return None
 
 def detect_anomaly(text: str):
-    text = text.lower()
+    normalized = normalize_text(text)
+
     for pattern in DENY_PATTERNS:
-        if pattern in text:
+        if pattern in normalized:
             return True, f"DENY_PATTERN:{pattern}"
+
+    group_reason = group_match(normalized)
+    if group_reason:
+        return True, group_reason
+
     return False, None
 
 def validate_token(token: str):
@@ -101,35 +197,24 @@ def risk_score(action, anomaly):
         score += 40
     return min(score, 100)
 
-def log_event(entry: dict):
-    print({
-        "timestamp": datetime.utcnow().isoformat(),
-        **entry
-    })
-
 # =========================
 # MAIN ENDPOINT
 # =========================
 
 @app.post("/david")
 async def david(request: Request):
-
     body = await request.json()
     headers = request.headers
 
     request_text = str(body)
     action = body.get("action", "unknown")
 
-    # =========================
-    # AUTHORIZATION
-    # =========================
-
     auth_header = headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         log_event({"decision": "DENY", "reason": "MISSING_AUTH"})
         raise HTTPException(status_code=403, detail="DENY: MISSING_AUTH")
 
-    token = auth_header.split(" ")[1]
+    token = auth_header.split(" ", 1)[1].strip()
 
     valid, token_data = validate_token(token)
     if not valid:
@@ -138,54 +223,22 @@ async def david(request: Request):
 
     role = token_data["role"]
 
-    # =========================
-    # ANOMALY DETECTION
-    # =========================
-
     anomaly, anomaly_reason = detect_anomaly(request_text)
-
-    # =========================
-    # ACTION CONTROL
-    # =========================
 
     if action not in ALLOW_ACTIONS and action not in SENSITIVE_ACTIONS:
         log_event({"decision": "DENY", "reason": "UNKNOWN_ACTION"})
         raise HTTPException(status_code=403, detail="DENY: UNKNOWN_ACTION")
-
-    # =========================
-    # DUAL APPROVAL CHECK
-    # =========================
 
     if action in SENSITIVE_ACTIONS:
         if not require_dual_approval(headers):
             log_event({"decision": "DENY", "reason": "DUAL_APPROVAL_REQUIRED"})
             raise HTTPException(status_code=403, detail="DENY: DUAL_APPROVAL_REQUIRED")
 
-    # =========================
-    # ANOMALY BLOCK
-    # =========================
-
     if anomaly:
         log_event({"decision": "DENY", "reason": anomaly_reason})
         raise HTTPException(status_code=403, detail=f"DENY: {anomaly_reason}")
 
-    # =========================
-    # FAIL CLOSED DEFAULT
-    # =========================
-
-    if action not in ALLOW_ACTIONS and action not in SENSITIVE_ACTIONS:
-        log_event({"decision": "DENY", "reason": "FAIL_CLOSED"})
-        raise HTTPException(status_code=403, detail="DENY: FAIL_CLOSED")
-
-    # =========================
-    # MARK TOKEN USED
-    # =========================
-
     mark_token_used(token)
-
-    # =========================
-    # RISK + RESPONSE
-    # =========================
 
     score = risk_score(action, anomaly)
 
@@ -198,5 +251,4 @@ async def david(request: Request):
     }
 
     log_event(decision)
-
     return decision
