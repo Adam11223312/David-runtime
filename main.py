@@ -1,224 +1,185 @@
 from fastapi import FastAPI, Request, HTTPException
-import time
+from datetime import datetime, timedelta
 import hashlib
 import uuid
-import re
-import unicodedata
 
 app = FastAPI()
-
-API_KEY = "david_rt_93jf82hf92hf82hf82hfi238hf"
 
 # =========================
 # CONFIG
 # =========================
-ALLOW_RULES = [
-    "help",
-    "status",
-    "status check",
-    "normal query"
+
+VALID_TOKENS = {
+    "david_rt_93jf82hf92hf82hf82hfi238hf": {
+        "role": "admin",
+        "expires": datetime.utcnow() + timedelta(hours=12)
+    }
+}
+
+USED_TOKENS = set()
+
+ALLOW_ACTIONS = {
+    "read",
+    "analyze"
+}
+
+SENSITIVE_ACTIONS = {
+    "transfer",
+    "write",
+    "external_call",
+    "admin"
+}
+
+DENY_PATTERNS = [
+    "bypass",
+    "ignore previous",
+    "override",
+    "system prompt",
+    "hack",
+    "exploit",
+    "inject",
+    "jailbreak"
 ]
 
-HIGH_RISK_ACTIONS = [
-    "wire_transfer",
-    "send_money",
-    "change_account",
-    "admin_change"
-]
-
-used_tokens = set()
-pending_approvals = {}
-
 # =========================
-# NORMALIZATION
+# HELPERS
 # =========================
-def normalize(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text)
-    text = text.lower().strip()
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
-    return text
 
-# =========================
-# TOKEN SYSTEM
-# =========================
-def generate_token(user_id, device_id, action):
-    raw = f"{user_id}:{device_id}:{action}:{time.time()}:{uuid.uuid4()}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+def hash_request(data: str):
+    return hashlib.sha256(data.encode()).hexdigest()
 
-def validate_token(token):
-    if token in used_tokens:
-        return False, "TOKEN_REPLAY"
+def detect_anomaly(text: str):
+    text = text.lower()
+    for pattern in DENY_PATTERNS:
+        if pattern in text:
+            return True, f"DENY_PATTERN:{pattern}"
+    return False, None
 
-    # simulate expiration (short-lived)
-    if len(token) < 10:
-        return False, "TOKEN_INVALID"
+def validate_token(token: str):
+    if token in USED_TOKENS:
+        return False, "TOKEN_ALREADY_USED"
 
-    used_tokens.add(token)
-    return True, "VALID"
+    data = VALID_TOKENS.get(token)
+    if not data:
+        return False, "INVALID_TOKEN"
 
-# =========================
-# RISK SCORING
-# =========================
-def risk_score(action, device_known=True):
+    if datetime.utcnow() > data["expires"]:
+        return False, "TOKEN_EXPIRED"
+
+    return True, data
+
+def mark_token_used(token: str):
+    USED_TOKENS.add(token)
+
+def require_dual_approval(headers):
+    local = headers.get("X-Local-Approval")
+    remote = headers.get("X-Remote-Approval")
+    return local == "approved" and remote == "approved"
+
+def risk_score(action, anomaly):
     score = 0
-
-    if action in HIGH_RISK_ACTIONS:
-        score += 60
-
-    if not device_known:
-        score += 30
-
+    if action in SENSITIVE_ACTIONS:
+        score += 50
+    if anomaly:
+        score += 40
     return min(score, 100)
 
-# =========================
-# LOGGING
-# =========================
-def log_event(data):
+def log_event(entry: dict):
     print({
-        "timestamp": time.time(),
-        **data
+        "timestamp": datetime.utcnow().isoformat(),
+        **entry
     })
-
-# =========================
-# AUTH CHECK
-# =========================
-def check_auth(header):
-    if not header:
-        raise HTTPException(status_code=401, detail="AUTH_HEADER_MISSING")
-
-    if not header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="AUTH_HEADER_INVALID")
-
-    token = header.split(" ")[1]
-
-    if token != API_KEY:
-        raise HTTPException(status_code=403, detail="AUTH_FAILED")
 
 # =========================
 # MAIN ENDPOINT
 # =========================
-@app.post("/authorize")
-async def authorize(request: Request):
+
+@app.post("/david")
+async def david(request: Request):
+
     body = await request.json()
+    headers = request.headers
 
-    # -------------------------
-    # HEADER CHECK
-    # -------------------------
-    check_auth(request.headers.get("Authorization"))
+    request_text = str(body)
+    action = body.get("action", "unknown")
 
-    # -------------------------
-    # REQUIRED FIELDS
-    # -------------------------
-    user_id = body.get("user_id")
-    device_id = body.get("device_id")
-    action = normalize(body.get("action", ""))
-    token = body.get("token")
+    # =========================
+    # AUTHORIZATION
+    # =========================
 
-    if not user_id or not device_id or not action:
-        raise HTTPException(status_code=400, detail="INPUT_MISSING")
+    auth_header = headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        log_event({"decision": "DENY", "reason": "MISSING_AUTH"})
+        raise HTTPException(status_code=403, detail="DENY: MISSING_AUTH")
 
-    # -------------------------
-    # ALLOW RULE CHECK
-    # -------------------------
-    if action not in ALLOW_RULES and action not in HIGH_RISK_ACTIONS:
-        log_event({"decision": "BLOCK", "reason": "UNKNOWN_ACTION"})
-        return {"decision": "BLOCK", "reason": "UNKNOWN_ACTION"}
+    token = auth_header.split(" ")[1]
 
-    # -------------------------
-    # TOKEN CHECK
-    # -------------------------
-    if token:
-        valid, reason = validate_token(token)
-        if not valid:
-            log_event({"decision": "BLOCK", "reason": reason})
-            return {"decision": "BLOCK", "reason": reason}
+    valid, token_data = validate_token(token)
+    if not valid:
+        log_event({"decision": "DENY", "reason": token_data})
+        raise HTTPException(status_code=403, detail=f"DENY: {token_data}")
 
-    # -------------------------
-    # RISK
-    # -------------------------
-    score = risk_score(action)
+    role = token_data["role"]
 
-    # -------------------------
-    # HIGH RISK → DUAL APPROVAL
-    # -------------------------
-    if action in HIGH_RISK_ACTIONS:
-        approval_id = str(uuid.uuid4())
+    # =========================
+    # ANOMALY DETECTION
+    # =========================
 
-        pending_approvals[approval_id] = {
-            "user_id": user_id,
-            "device_id": device_id,
-            "action": action,
-            "timestamp": time.time()
-        }
+    anomaly, anomaly_reason = detect_anomaly(request_text)
 
-        log_event({
-            "decision": "PENDING",
-            "reason": "SECOND_APPROVAL_REQUIRED",
-            "approval_id": approval_id
-        })
+    # =========================
+    # ACTION CONTROL
+    # =========================
 
-        return {
-            "decision": "PENDING_DUAL_APPROVAL",
-            "approval_id": approval_id,
-            "risk_score": score
-        }
+    if action not in ALLOW_ACTIONS and action not in SENSITIVE_ACTIONS:
+        log_event({"decision": "DENY", "reason": "UNKNOWN_ACTION"})
+        raise HTTPException(status_code=403, detail="DENY: UNKNOWN_ACTION")
 
-    # -------------------------
-    # LOW RISK → ALLOW
-    # -------------------------
-    log_event({
+    # =========================
+    # DUAL APPROVAL CHECK
+    # =========================
+
+    if action in SENSITIVE_ACTIONS:
+        if not require_dual_approval(headers):
+            log_event({"decision": "DENY", "reason": "DUAL_APPROVAL_REQUIRED"})
+            raise HTTPException(status_code=403, detail="DENY: DUAL_APPROVAL_REQUIRED")
+
+    # =========================
+    # ANOMALY BLOCK
+    # =========================
+
+    if anomaly:
+        log_event({"decision": "DENY", "reason": anomaly_reason})
+        raise HTTPException(status_code=403, detail=f"DENY: {anomaly_reason}")
+
+    # =========================
+    # FAIL CLOSED DEFAULT
+    # =========================
+
+    if action not in ALLOW_ACTIONS and action not in SENSITIVE_ACTIONS:
+        log_event({"decision": "DENY", "reason": "FAIL_CLOSED"})
+        raise HTTPException(status_code=403, detail="DENY: FAIL_CLOSED")
+
+    # =========================
+    # MARK TOKEN USED
+    # =========================
+
+    mark_token_used(token)
+
+    # =========================
+    # RISK + RESPONSE
+    # =========================
+
+    score = risk_score(action, anomaly)
+
+    decision = {
         "decision": "ALLOW",
-        "reason": "VALID",
-        "risk_score": score
-    })
-
-    return {
-        "decision": "ALLOW",
-        "risk_score": score
+        "action": action,
+        "role": role,
+        "risk_score": score,
+        "request_id": str(uuid.uuid4())
     }
 
-# =========================
-# SECOND APPROVAL ENDPOINT
-# =========================
-@app.post("/approve")
-async def approve(request: Request):
-    body = await request.json()
+    log_event(decision)
 
-    check_auth(request.headers.get("Authorization"))
-
-    approval_id = body.get("approval_id")
-    device_id = body.get("device_id")
-
-    if approval_id not in pending_approvals:
-        return {"decision": "BLOCK", "reason": "INVALID_APPROVAL"}
-
-    record = pending_approvals[approval_id]
-
-    # -------------------------
-    # MUST BE DIFFERENT DEVICE
-    # -------------------------
-    if record["device_id"] == device_id:
-        return {"decision": "BLOCK", "reason": "SECOND_APPROVAL_NOT_INDEPENDENT"}
-
-    # -------------------------
-    # EXPIRATION
-    # -------------------------
-    if time.time() - record["timestamp"] > 120:
-        del pending_approvals[approval_id]
-        return {"decision": "BLOCK", "reason": "APPROVAL_EXPIRED"}
-
-    # -------------------------
-    # SUCCESS
-    # -------------------------
-    del pending_approvals[approval_id]
-
-    log_event({
-        "decision": "ALLOW",
-        "reason": "DUAL_APPROVAL_SUCCESS"
-    })
-
-    return {
-        "decision": "ALLOW",
-        "reason": "DUAL_APPROVAL_SUCCESS"
-    }
+    return decision
