@@ -15,7 +15,7 @@ VALID_TOKENS = {
         "role": "admin",
         "expires": datetime.utcnow() + timedelta(hours=12)
     },
-    "david_rt_test2": {
+    "david_rt_fresh1": {
         "role": "admin",
         "expires": datetime.utcnow() + timedelta(hours=12)
     },
