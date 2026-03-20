@@ -1,710 +1,678 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-
-app = FastAPI()
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-    <html>
-    <head>
-        <title>David Security System</title>
-        <style>
-            body {
-                font-family: Arial;
-                background: black;
-                color: lime;
-                text-align: center;
-            }
-            h1 { color: lime; }
-            input {
-                font-size: 20px;
-                padding: 10px;
-                width: 300px;
-                text-align: center;
-            }
-            button {
-                margin: 5px;
-                padding: 10px;
-                font-size: 18px;
-                width: 50px;
-                background: #111;
-                color: lime;
-                border: 1px solid lime;
-            }
-            .wide { width: 110px; }
-            .result { margin-top: 20px; font-size: 24px; }
-        </style>
-    </head>
-    <body>
-
-        <h1>DAVID SECURITY SYSTEM</h1>
-        <p>Status: ACTIVE | Mode: FAIL-CLOSED</p>
-
-        <input id="inputBox" placeholder="Enter Code..." readonly><br><br>
-
-        <div id="keyboard"></div>
-
-        <br>
-        <button class="wide" onclick="submitCode()">ENTER</button>
-        <button class="wide" onclick="clearInput()">CLEAR</button>
-
-        <div class="result" id="result"></div>
-
-        <script>
-            const keys = "1234567890QWERTYUIOPASDFGHJKLZXCVBNM";
-
-            const keyboard = document.getElementById("keyboard");
-
-            keys.split("").forEach(k => {
-                let btn = document.createElement("button");
-                btn.innerText = k;
-                btn.onclick = () => addChar(k);
-                keyboard.appendChild(btn);
-            });
-
-            function addChar(char) {
-                document.getElementById("inputBox").value += char;
-            }
-
-            function clearInput() {
-                document.getElementById("inputBox").value = "";
-                document.getElementById("result").innerText = "";
-            }
-
-            function submitCode() {
-                let value = document.getElementById("inputBox").value;
-
-                if (value === "DAVID123") {
-                    document.getElementById("result").innerText = "✅ ACCESS GRANTED";
-                    document.getElementById("result").style.color = "lime";
-                } else {
-                    document.getElementById("result").innerText = "❌ ACCESS DENIED";
-                    document.getElementById("result").style.color = "red";
-                }
-            }
-        </script>
-
-    </body>
-    </html>
-    """
-import os
-import time
-import json
+from fastapi import FastAPI, Request, Header
+from fastapi.responses import HTMLResponse, JSONResponse
+from datetime import datetime, timedelta
 import uuid
 import hmac
 import hashlib
-from typing import Dict, Any, Optional
-from datetime import datetime, timedelta, timezone
+import json
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+app = FastAPI()
 
-
-app = FastAPI(title="David Security Gateway")
-
-
-# =========================================================
+# =========================
 # CONFIG
-# =========================================================
+# =========================
+CORRECT_CODE = "DAVID123"
+ADMIN_KEY = "adminsecure"
+VALID_DEVICE_ID = "trusted-device-01"
+DEVICE_SHARED_SECRET = "device-shared-secret"
+TOKEN_TTL_SECONDS = 60
+DUAL_AUTH_WINDOW_SECONDS = 120
 
-APP_NAME = "David Security Gateway"
-APP_MODE = "fail-closed"
+# =========================
+# STATE
+# =========================
+logs = []
+active_tokens = {}
+used_tokens = set()
+dual_approvals = {}
 
-TRUSTED_IPS = {
-    ip.strip() for ip in os.getenv("TRUSTED_IPS", "").split(",") if ip.strip()
-}
-
-REQUIRE_DEVICE_PROOF = os.getenv("REQUIRE_DEVICE_PROOF", "true").lower() == "true"
-DEVICE_PROOF_SECRET = os.getenv("DEVICE_PROOF_SECRET", "change-me-now")
-DAVID_ADMIN_SECRET = os.getenv("DAVID_ADMIN_SECRET", "change-me-now-too")
-
-RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
-RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "30"))
-
-HIGH_RISK_THRESHOLD = int(os.getenv("HIGH_RISK_THRESHOLD", "5"))
-TRANSFER_APPROVAL_THRESHOLD = float(os.getenv("TRANSFER_APPROVAL_THRESHOLD", "1000"))
-
-ALLOWED_ENDPOINTS = {
-    "/balance": ["user", "admin"],
-    "/transfer": ["user", "admin"],
-    "/admin/approve-transfer": ["admin"],
-    "/admin/issue-token": ["admin"],
-    "/admin/revoke-token": ["admin"],
-    "/admin/pending-transfers": ["admin"],
-}
-
-# In production, move these stores to Redis/Postgres.
-RATE_LIMIT_STORE: Dict[str, list] = {}
-PENDING_TRANSFERS: Dict[str, Dict[str, Any]] = {}
-REVOKED_TOKEN_HASHES = set()
-
-# Token store keeps HASHED tokens only.
-# Format:
-# token_hash -> {role, expires, one_time, used, label}
-TOKEN_STORE: Dict[str, Dict[str, Any]] = {}
-
-
-# =========================================================
+# =========================
 # HELPERS
-# =========================================================
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
+# =========================
+def now_utc() -> datetime:
+    return datetime.utcnow()
 
 def iso_now() -> str:
-    return utcnow().isoformat()
+    return now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-
-def sha256_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def safe_json_log(event: Dict[str, Any]) -> None:
-    print(json.dumps(event, default=str))
-
-
-def log_event(
-    request_id: str,
-    path: str,
-    method: str,
-    decision: str,
-    reason: str,
-    status_code: int,
-    ip: str,
-    role: Optional[str] = None,
-    risk_score: int = 0,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    payload = {
-        "timestamp": iso_now(),
-        "request_id": request_id,
-        "app": APP_NAME,
-        "path": path,
-        "method": method,
-        "decision": decision,
-        "reason": reason,
-        "status_code": status_code,
-        "ip": ip,
-        "role": role,
+def log_event(status: str, reason_code: str, risk_score: int, details: dict | None = None):
+    entry = {
+        "time": iso_now(),
+        "status": status,
+        "reason_code": reason_code,
         "risk_score": risk_score,
+        "details": details or {}
     }
-    if extra:
-        payload.update(extra)
-    safe_json_log(payload)
+    logs.append(entry)
+    if len(logs) > 500:
+        logs.pop(0)
 
+def sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
 
-def client_ip(request: Request) -> str:
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
+def make_hmac(message: str, secret: str) -> str:
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
+def build_device_message(device_id: str, nonce: str) -> str:
+    return f"{device_id}:{nonce}"
 
-def check_rate_limit(ip: str) -> bool:
-    now = time.time()
-    if ip not in RATE_LIMIT_STORE:
-        RATE_LIMIT_STORE[ip] = []
+def cleanup_expired_tokens():
+    expired = []
+    current = now_utc()
+    for token, info in active_tokens.items():
+        if info["expires_at"] < current:
+            expired.append(token)
+    for token in expired:
+        del active_tokens[token]
 
-    RATE_LIMIT_STORE[ip] = [
-        ts for ts in RATE_LIMIT_STORE[ip]
-        if now - ts < RATE_LIMIT_WINDOW
-    ]
+def cleanup_expired_dual_approvals():
+    expired = []
+    current = now_utc()
+    for tx_id, info in dual_approvals.items():
+        if info["expires_at"] < current:
+            expired.append(tx_id)
+    for tx_id in expired:
+        del dual_approvals[tx_id]
 
-    if len(RATE_LIMIT_STORE[ip]) >= RATE_LIMIT_MAX:
-        return False
-
-    RATE_LIMIT_STORE[ip].append(now)
-    return True
-
-
-def verify_device_proof(request: Request) -> bool:
-    """
-    Simple device proof:
-    client sends header x-device-id and x-device-proof
-    proof = HMAC_SHA256(DEVICE_PROOF_SECRET, device_id)
-    """
-    device_id = request.headers.get("x-device-id")
-    device_proof = request.headers.get("x-device-proof")
-
-    if not device_id or not device_proof:
-        return False
-
-    expected = hmac.new(
-        DEVICE_PROOF_SECRET.encode("utf-8"),
-        device_id.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    return hmac.compare_digest(expected, device_proof)
-
-
-def make_token_record(
-    role: str,
-    ttl_minutes: int = 60,
-    one_time: bool = False,
-    label: str = ""
-) -> Dict[str, Any]:
-    raw_token = str(uuid.uuid4())
-    token_hash = sha256_text(raw_token)
-    expires = utcnow() + timedelta(minutes=ttl_minutes)
-
-    TOKEN_STORE[token_hash] = {
-        "role": role,
-        "expires": expires,
-        "one_time": one_time,
-        "used": False,
-        "label": label,
-        "created_at": utcnow(),
-    }
-
-    return {
-        "token": raw_token,  # only shown once
-        "role": role,
-        "expires": expires.isoformat(),
-        "one_time": one_time,
-        "label": label,
-    }
-
-
-def get_token_data(raw_token: str) -> Optional[Dict[str, Any]]:
-    token_hash = sha256_text(raw_token)
-
-    if token_hash in REVOKED_TOKEN_HASHES:
-        return None
-
-    return TOKEN_STORE.get(token_hash)
-
-
-def revoke_token(raw_token: str) -> bool:
-    token_hash = sha256_text(raw_token)
-    if token_hash in TOKEN_STORE:
-        REVOKED_TOKEN_HASHES.add(token_hash)
-        return True
-    return False
-
-
-def compute_risk_score(request: Request, path: str, body: Any) -> int:
+def compute_risk(
+    has_token: bool,
+    token_valid: bool,
+    token_reused: bool,
+    device_ok: bool,
+    code_ok: bool,
+    biometric_ok: bool,
+    transaction_type: str
+) -> int:
     risk = 0
-    ip = client_ip(request)
 
-    if ip not in TRUSTED_IPS and TRUSTED_IPS:
-        risk += 2
+    if not has_token:
+        risk += 35
+    if not token_valid:
+        risk += 25
+    if token_reused:
+        risk += 30
+    if not device_ok:
+        risk += 20
+    if not code_ok:
+        risk += 15
+    if not biometric_ok:
+        risk += 10
 
-    if path.startswith("/admin"):
-        risk += 2
+    if transaction_type == "medium":
+        risk += 10
+    elif transaction_type == "high":
+        risk += 25
 
-    user_agent = request.headers.get("user-agent", "")
-    if not user_agent:
-        risk += 1
+    return min(risk, 100)
 
-    if REQUIRE_DEVICE_PROOF and not verify_device_proof(request):
-        risk += 2
+def requires_dual_auth(transaction_type: str) -> bool:
+    return transaction_type == "high"
 
-    if isinstance(body, dict):
-        amount = body.get("amount")
-        if isinstance(amount, (int, float)) and amount >= TRANSFER_APPROVAL_THRESHOLD:
-            risk += 3
+def validate_device_proof(device_id: str | None, nonce: str | None, device_signature: str | None) -> bool:
+    if not device_id or not nonce or not device_signature:
+        return False
+    if device_id != VALID_DEVICE_ID:
+        return False
+    expected = make_hmac(build_device_message(device_id, nonce), DEVICE_SHARED_SECRET)
+    return hmac.compare_digest(expected, device_signature)
 
-    return risk
+def validate_biometric(biometric: str | None) -> bool:
+    # Demo enforcement. Replace with real biometric attestation later.
+    return biometric == "verified"
 
+def get_reason_for_denial(
+    has_token: bool,
+    token_reused: bool,
+    token_valid: bool,
+    device_ok: bool,
+    code_ok: bool,
+    biometric_ok: bool,
+    dual_ok: bool,
+    transaction_type: str
+) -> str:
+    if not has_token:
+        return "NO_TOKEN"
+    if token_reused:
+        return "TOKEN_REUSED"
+    if not token_valid:
+        return "INVALID_OR_EXPIRED_TOKEN"
+    if not device_ok:
+        return "DEVICE_PROOF_FAILED"
+    if not code_ok:
+        return "WRONG_CODE"
+    if not biometric_ok:
+        return "BIOMETRIC_FAILED"
+    if requires_dual_auth(transaction_type) and not dual_ok:
+        return "DUAL_AUTH_REQUIRED"
+    return "UNKNOWN_DENIAL"
 
-async def read_json_safe(request: Request) -> Any:
-    try:
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            return await request.json()
-        return None
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed JSON")
+# =========================
+# UI
+# =========================
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>David Security System</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+        <style>
+            body {
+                margin: 0;
+                font-family: Arial, sans-serif;
+                background: #05070a;
+                color: #00ff88;
+                text-align: center;
+            }
+            .wrap {
+                max-width: 900px;
+                margin: 0 auto;
+                padding: 20px;
+            }
+            .card {
+                background: #0d1117;
+                border: 1px solid #1f2937;
+                border-radius: 16px;
+                padding: 20px;
+                box-shadow: 0 0 20px rgba(0,255,136,0.08);
+            }
+            h1 { margin-bottom: 8px; }
+            .sub { color: #9ca3af; margin-bottom: 18px; }
+            .status {
+                display: flex;
+                justify-content: center;
+                gap: 10px;
+                flex-wrap: wrap;
+                margin-bottom: 18px;
+            }
+            .pill {
+                border: 1px solid #00ff88;
+                border-radius: 999px;
+                padding: 8px 14px;
+                font-size: 14px;
+            }
+            input, select {
+                width: 92%;
+                max-width: 500px;
+                padding: 14px;
+                font-size: 20px;
+                text-align: center;
+                color: #00ff88;
+                background: black;
+                border: 1px solid #00ff88;
+                border-radius: 10px;
+                margin-bottom: 12px;
+            }
+            .row {
+                display: flex;
+                justify-content: center;
+                gap: 12px;
+                flex-wrap: wrap;
+                margin-bottom: 12px;
+            }
+            button {
+                background: #111827;
+                color: #00ff88;
+                border: 1px solid #00ff88;
+                border-radius: 10px;
+                padding: 12px 14px;
+                margin: 4px;
+                font-size: 16px;
+                min-width: 60px;
+                cursor: pointer;
+            }
+            button:hover {
+                background: #0b1220;
+            }
+            .wide {
+                min-width: 150px;
+            }
+            .result {
+                margin-top: 18px;
+                font-size: 24px;
+                min-height: 32px;
+            }
+            .logs {
+                text-align: left;
+                margin-top: 20px;
+                border: 1px solid #00ff88;
+                border-radius: 12px;
+                padding: 14px;
+                max-height: 260px;
+                overflow-y: auto;
+                font-size: 12px;
+                background: #020406;
+            }
+            .keygrid {
+                max-width: 520px;
+                margin: 0 auto 16px auto;
+            }
+            .small {
+                color: #9ca3af;
+                font-size: 13px;
+                margin-bottom: 10px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <div class="card">
+                <h1>DAVID SECURITY SYSTEM</h1>
+                <div class="sub">Adaptive fail-closed security with token rotation, device proof, biometrics, risk scoring, and dual authorization</div>
 
+                <div class="status">
+                    <div class="pill">STATUS: ACTIVE</div>
+                    <div class="pill">MODE: FAIL-CLOSED</div>
+                    <div class="pill">TOKEN: SINGLE USE</div>
+                    <div class="pill">DUAL AUTH: STEP-UP</div>
+                </div>
 
-# =========================================================
-# BOOTSTRAP ADMIN TOKEN
-# =========================================================
+                <input id="codeBox" placeholder="Enter code..." readonly />
+                <div class="keygrid" id="keyboard"></div>
 
-def bootstrap_admin_token() -> None:
-    raw = os.getenv("DAVID_BOOTSTRAP_ADMIN_TOKEN", "").strip()
-    if not raw:
-        return
+                <div class="row">
+                    <select id="txnType">
+                        <option value="low">LOW RISK</option>
+                        <option value="medium">MEDIUM RISK</option>
+                        <option value="high">HIGH RISK</option>
+                    </select>
+                </div>
 
-    token_hash = sha256_text(raw)
-    TOKEN_STORE[token_hash] = {
-        "role": "admin",
-        "expires": utcnow() + timedelta(days=30),
-        "one_time": False,
+                <div class="row">
+                    <button class="wide" onclick="setBiometric('verified')">BIOMETRIC OK</button>
+                    <button class="wide" onclick="setBiometric('failed')">BIOMETRIC FAIL</button>
+                    <button class="wide" onclick="approveDual()">2ND APPROVAL</button>
+                </div>
+
+                <div class="row">
+                    <button class="wide" onclick="submitCode()">ENTER</button>
+                    <button class="wide" onclick="clearCode()">CLEAR</button>
+                    <button class="wide" onclick="simulateAttack()">ATTACK</button>
+                </div>
+
+                <div class="small" id="metaBox">Biometric: not set | Dual approval: pending</div>
+                <div class="result" id="resultBox"></div>
+
+                <div class="logs" id="logsBox">Loading logs...</div>
+            </div>
+        </div>
+
+        <script>
+            const keys = "1234567890QWERTYUIOPASDFGHJKLZXCVBNM";
+            const keyboard = document.getElementById("keyboard");
+            const codeBox = document.getElementById("codeBox");
+            const resultBox = document.getElementById("resultBox");
+            const logsBox = document.getElementById("logsBox");
+            const metaBox = document.getElementById("metaBox");
+
+            let biometricState = "failed";
+            let dualApproved = false;
+
+            keys.split("").forEach(k => {
+                const btn = document.createElement("button");
+                btn.textContent = k;
+                btn.onclick = () => codeBox.value += k;
+                keyboard.appendChild(btn);
+            });
+
+            function clearCode() {
+                codeBox.value = "";
+                resultBox.textContent = "";
+            }
+
+            function setBiometric(value) {
+                biometricState = value;
+                updateMeta();
+            }
+
+            function updateMeta() {
+                metaBox.textContent = `Biometric: ${biometricState} | Dual approval: ${dualApproved ? "approved" : "pending"}`;
+            }
+
+            async function getToken() {
+                const r = await fetch("/token");
+                return await r.json();
+            }
+
+            async function approveDual() {
+                const txId = crypto.randomUUID();
+                const body = {
+                    tx_id: txId,
+                    approver_1: "primary-user",
+                    approver_2: "secondary-user",
+                    device_1: "trusted-device-01",
+                    device_2: "trusted-device-02"
+                };
+
+                const r = await fetch("/dual-approve", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify(body)
+                });
+
+                const data = await r.json();
+                if (data.status === "approved") {
+                    window.currentTxId = txId;
+                    dualApproved = true;
+                    resultBox.style.color = "#00ff88";
+                    resultBox.textContent = "DUAL APPROVAL RECORDED";
+                } else {
+                    resultBox.style.color = "orange";
+                    resultBox.textContent = "DUAL APPROVAL FAILED";
+                }
+                updateMeta();
+                loadLogs();
+            }
+
+            async function submitCode() {
+                const txnType = document.getElementById("txnType").value;
+                const tokenResp = await getToken();
+
+                const deviceId = tokenResp.device_id;
+                const nonce = tokenResp.nonce;
+                const signature = tokenResp.device_signature;
+                const token = tokenResp.token;
+
+                const payload = {
+                    code: codeBox.value,
+                    transaction_type: txnType,
+                    biometric: biometricState,
+                    tx_id: txnType === "high" ? (window.currentTxId || "") : ""
+                };
+
+                const r = await fetch("/validate", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer " + token,
+                        "X-Device-ID": deviceId,
+                        "X-Device-Nonce": nonce,
+                        "X-Device-Signature": signature
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await r.json();
+
+                if (data.status === "allowed") {
+                    resultBox.style.color = "#00ff88";
+                    resultBox.textContent = "ACCESS GRANTED";
+                } else {
+                    resultBox.style.color = "red";
+                    resultBox.textContent = "ACCESS DENIED: " + (data.reason_code || "UNKNOWN");
+                }
+
+                if (txnType === "high") {
+                    dualApproved = false;
+                    window.currentTxId = "";
+                    updateMeta();
+                }
+
+                await loadLogs();
+            }
+
+            async function simulateAttack() {
+                const r = await fetch("/attack");
+                const data = await r.json();
+                resultBox.style.color = "orange";
+                resultBox.textContent = "ATTACK BLOCKED: " + data.reason_code;
+                await loadLogs();
+            }
+
+            async function loadLogs() {
+                const r = await fetch("/logs");
+                const data = await r.json();
+                logsBox.innerHTML = "";
+
+                const items = [...data.logs].reverse();
+                if (!items.length) {
+                    logsBox.textContent = "No logs yet.";
+                    return;
+                }
+
+                items.forEach(l => {
+                    const line = document.createElement("div");
+                    line.style.marginBottom = "8px";
+                    line.textContent = `${l.time} | ${l.status} | ${l.reason_code} | risk=${l.risk_score}`;
+                    logsBox.appendChild(line);
+                });
+            }
+
+            updateMeta();
+            loadLogs();
+        </script>
+    </body>
+    </html>
+    """
+
+# =========================
+# TOKEN ISSUANCE
+# =========================
+@app.get("/token")
+def generate_token():
+    cleanup_expired_tokens()
+
+    token = str(uuid.uuid4())
+    nonce = str(uuid.uuid4())
+    device_id = VALID_DEVICE_ID
+    device_signature = make_hmac(build_device_message(device_id, nonce), DEVICE_SHARED_SECRET)
+
+    active_tokens[token] = {
+        "issued_at": now_utc(),
+        "expires_at": now_utc() + timedelta(seconds=TOKEN_TTL_SECONDS),
+        "device_id": device_id,
+        "nonce": nonce,
         "used": False,
-        "label": "bootstrap-admin",
-        "created_at": utcnow(),
+        "token_hash": sha256_hex(token)
     }
-
-
-bootstrap_admin_token()
-
-
-# =========================================================
-# SECURITY CORE
-# =========================================================
-
-async def enforce_security(request: Request) -> Dict[str, Any]:
-    request_id = str(uuid.uuid4())
-    path = request.url.path
-    method = request.method
-    ip = client_ip(request)
-
-    request.state.request_id = request_id
-
-    # Public endpoints
-    if path in ["/", "/health"]:
-        return {
-            "request_id": request_id,
-            "role": None,
-            "risk_score": 0,
-            "token": None,
-            "body": None,
-        }
-
-    # Rate limit first
-    if not check_rate_limit(ip):
-        log_event(
-            request_id=request_id,
-            path=path,
-            method=method,
-            decision="deny",
-            reason="rate_limit",
-            status_code=429,
-            ip=ip,
-        )
-        raise HTTPException(status_code=429, detail="Too many requests")
-
-    body = await read_json_safe(request)
-
-    # Authorization required
-    auth = request.headers.get("authorization")
-    if not auth or not auth.startswith("Bearer "):
-        log_event(
-            request_id=request_id,
-            path=path,
-            method=method,
-            decision="deny",
-            reason="missing_auth",
-            status_code=401,
-            ip=ip,
-        )
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    raw_token = auth.split(" ", 1)[1].strip()
-    token_data = get_token_data(raw_token)
-
-    if not token_data:
-        log_event(
-            request_id=request_id,
-            path=path,
-            method=method,
-            decision="deny",
-            reason="invalid_or_revoked_token",
-            status_code=403,
-            ip=ip,
-        )
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    if utcnow() > token_data["expires"]:
-        log_event(
-            request_id=request_id,
-            path=path,
-            method=method,
-            decision="deny",
-            reason="token_expired",
-            status_code=403,
-            ip=ip,
-            role=token_data["role"],
-        )
-        raise HTTPException(status_code=403, detail="Token expired")
-
-    if token_data.get("one_time") and token_data.get("used"):
-        log_event(
-            request_id=request_id,
-            path=path,
-            method=method,
-            decision="deny",
-            reason="one_time_token_already_used",
-            status_code=403,
-            ip=ip,
-            role=token_data["role"],
-        )
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    if path not in ALLOWED_ENDPOINTS:
-        log_event(
-            request_id=request_id,
-            path=path,
-            method=method,
-            decision="deny",
-            reason="unknown_endpoint",
-            status_code=404,
-            ip=ip,
-            role=token_data["role"],
-        )
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    role = token_data["role"]
-
-    if role not in ALLOWED_ENDPOINTS[path]:
-        log_event(
-            request_id=request_id,
-            path=path,
-            method=method,
-            decision="deny",
-            reason="role_denied",
-            status_code=403,
-            ip=ip,
-            role=role,
-        )
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    risk_score = compute_risk_score(request, path, body)
-
-    if path.startswith("/admin") and REQUIRE_DEVICE_PROOF and not verify_device_proof(request):
-        log_event(
-            request_id=request_id,
-            path=path,
-            method=method,
-            decision="deny",
-            reason="missing_or_invalid_device_proof",
-            status_code=403,
-            ip=ip,
-            role=role,
-            risk_score=risk_score,
-        )
-        raise HTTPException(status_code=403, detail="Device proof required")
-
-    if risk_score >= HIGH_RISK_THRESHOLD and path != "/admin/approve-transfer":
-        log_event(
-            request_id=request_id,
-            path=path,
-            method=method,
-            decision="deny",
-            reason="high_risk_request",
-            status_code=403,
-            ip=ip,
-            role=role,
-            risk_score=risk_score,
-        )
-        raise HTTPException(status_code=403, detail="High risk request")
-
-    if token_data.get("one_time"):
-        token_data["used"] = True
-
-    request.state.role = role
-    request.state.risk_score = risk_score
-    request.state.token_label = token_data.get("label", "")
-    request.state.body = body
 
     log_event(
-        request_id=request_id,
-        path=path,
-        method=method,
-        decision="allow",
-        reason="authorized",
-        status_code=200,
-        ip=ip,
-        role=role,
-        risk_score=risk_score,
+        "INFO",
+        "TOKEN_ISSUED",
+        0,
+        {"token_hash": active_tokens[token]["token_hash"], "device_id": device_id}
     )
 
     return {
-        "request_id": request_id,
-        "role": role,
-        "risk_score": risk_score,
-        "token": raw_token,
-        "body": body,
+        "token": token,
+        "expires_in_seconds": TOKEN_TTL_SECONDS,
+        "device_id": device_id,
+        "nonce": nonce,
+        "device_signature": device_signature
     }
 
+# =========================
+# DUAL AUTH
+# =========================
+@app.post("/dual-approve")
+async def dual_approve(request: Request):
+    cleanup_expired_dual_approvals()
 
-# =========================================================
-# MIDDLEWARE
-# =========================================================
-
-@app.middleware("http")
-async def security_middleware(request: Request, call_next):
     try:
-        await enforce_security(request)
-        response = await call_next(request)
-        return response
-    except HTTPException as e:
-        return JSONResponse(status_code=e.status_code, content={"error": e.detail})
+        data = await request.json()
     except Exception:
-        request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
-        log_event(
-            request_id=request_id,
-            path=request.url.path,
-            method=request.method,
-            decision="deny",
-            reason="internal_fail_closed",
-            status_code=403,
-            ip=client_ip(request),
+        return JSONResponse({"status": "blocked", "reason_code": "BAD_JSON"}, status_code=400)
+
+    tx_id = data.get("tx_id", "").strip()
+    approver_1 = data.get("approver_1", "").strip()
+    approver_2 = data.get("approver_2", "").strip()
+    device_1 = data.get("device_1", "").strip()
+    device_2 = data.get("device_2", "").strip()
+
+    if not tx_id or not approver_1 or not approver_2 or not device_1 or not device_2:
+        log_event("DENIED", "DUAL_AUTH_BAD_REQUEST", 80, {"tx_id": tx_id})
+        return JSONResponse({"status": "blocked", "reason_code": "DUAL_AUTH_BAD_REQUEST"}, status_code=400)
+
+    if approver_1 == approver_2:
+        log_event("DENIED", "DUAL_AUTH_SAME_APPROVER", 90, {"tx_id": tx_id})
+        return JSONResponse({"status": "blocked", "reason_code": "DUAL_AUTH_SAME_APPROVER"}, status_code=403)
+
+    if device_1 == device_2:
+        log_event("DENIED", "DUAL_AUTH_SAME_DEVICE", 90, {"tx_id": tx_id})
+        return JSONResponse({"status": "blocked", "reason_code": "DUAL_AUTH_SAME_DEVICE"}, status_code=403)
+
+    dual_approvals[tx_id] = {
+        "approved": True,
+        "approver_1": approver_1,
+        "approver_2": approver_2,
+        "device_1": device_1,
+        "device_2": device_2,
+        "expires_at": now_utc() + timedelta(seconds=DUAL_AUTH_WINDOW_SECONDS)
+    }
+
+    log_event(
+        "INFO",
+        "DUAL_AUTH_APPROVED",
+        0,
+        {"tx_id": tx_id, "approver_1": approver_1, "approver_2": approver_2}
+    )
+
+    return {"status": "approved", "tx_id": tx_id}
+
+# =========================
+# VALIDATION
+# =========================
+@app.post("/validate")
+async def validate(
+    request: Request,
+    authorization: str | None = Header(None),
+    x_device_id: str | None = Header(None),
+    x_device_nonce: str | None = Header(None),
+    x_device_signature: str | None = Header(None)
+):
+    cleanup_expired_tokens()
+    cleanup_expired_dual_approvals()
+
+    try:
+        data = await request.json()
+    except Exception:
+        log_event("DENIED", "BAD_JSON", 95, {})
+        return JSONResponse({"status": "blocked", "reason_code": "BAD_JSON"}, status_code=400)
+
+    code = str(data.get("code", ""))
+    transaction_type = str(data.get("transaction_type", "low")).lower()
+    biometric = data.get("biometric")
+    tx_id = str(data.get("tx_id", ""))
+
+    if transaction_type not in {"low", "medium", "high"}:
+        transaction_type = "low"
+
+    has_token = authorization is not None and authorization.startswith("Bearer ")
+    token = authorization.replace("Bearer ", "", 1) if has_token else ""
+    token_reused = token in used_tokens
+    token_info = active_tokens.get(token)
+    token_valid = token_info is not None and not token_reused
+
+    device_ok = validate_device_proof(x_device_id, x_device_nonce, x_device_signature)
+    code_ok = (code == CORRECT_CODE)
+    biometric_ok = validate_biometric(biometric)
+
+    dual_ok = True
+    if requires_dual_auth(transaction_type):
+        approval = dual_approvals.get(tx_id)
+        dual_ok = bool(tx_id and approval and approval.get("approved") and approval.get("expires_at") > now_utc())
+
+    risk = compute_risk(
+        has_token=has_token,
+        token_valid=token_valid,
+        token_reused=token_reused,
+        device_ok=device_ok,
+        code_ok=code_ok,
+        biometric_ok=biometric_ok,
+        transaction_type=transaction_type
+    )
+
+    if requires_dual_auth(transaction_type) and not dual_ok:
+        risk = min(100, risk + 20)
+
+    if not (has_token and token_valid and not token_reused and device_ok and code_ok and biometric_ok and dual_ok):
+        reason = get_reason_for_denial(
+            has_token=has_token,
+            token_reused=token_reused,
+            token_valid=token_valid,
+            device_ok=device_ok,
+            code_ok=code_ok,
+            biometric_ok=biometric_ok,
+            dual_ok=dual_ok,
+            transaction_type=transaction_type
         )
-        return JSONResponse(status_code=403, content={"error": "Denied"})
+        log_event(
+            "DENIED",
+            reason,
+            risk,
+            {
+                "transaction_type": transaction_type,
+                "device_id": x_device_id,
+                "tx_id": tx_id
+            }
+        )
+        return JSONResponse(
+            {
+                "status": "blocked",
+                "reason_code": reason,
+                "risk_score": risk
+            },
+            status_code=403
+        )
 
+    used_tokens.add(token)
+    if token in active_tokens:
+        del active_tokens[token]
 
-# =========================================================
-# PUBLIC ROUTES
-# =========================================================
+    if requires_dual_auth(transaction_type) and tx_id in dual_approvals:
+        del dual_approvals[tx_id]
 
-@app.get("/")
-def root():
-    return {
-        "name": APP_NAME,
-        "status": "active",
-        "mode": APP_MODE,
-    }
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-# =========================================================
-# PROTECTED USER ROUTES
-# =========================================================
-
-@app.get("/balance")
-def balance(request: Request):
-    return {
-        "balance": "$5,000",
-        "role": request.state.role,
-        "risk_score": request.state.risk_score,
-        "request_id": request.state.request_id,
-    }
-
-
-@app.post("/transfer")
-def transfer(request: Request):
-    body = request.state.body or {}
-    amount = body.get("amount")
-    destination = body.get("destination")
-
-    if amount is None or destination is None:
-        raise HTTPException(status_code=400, detail="amount and destination required")
-
-    if not isinstance(amount, (int, float)) or amount <= 0:
-        raise HTTPException(status_code=400, detail="invalid amount")
-
-    # Dual approval for large transfers
-    if amount >= TRANSFER_APPROVAL_THRESHOLD:
-        transfer_id = str(uuid.uuid4())
-        PENDING_TRANSFERS[transfer_id] = {
-            "transfer_id": transfer_id,
-            "amount": amount,
-            "destination": destination,
-            "requested_by_role": request.state.role,
-            "requested_at": iso_now(),
-            "status": "pending_admin_approval",
-            "risk_score": request.state.risk_score,
-            "request_id": request.state.request_id,
+    log_event(
+        "ALLOWED",
+        "VERIFIED",
+        0,
+        {
+            "transaction_type": transaction_type,
+            "device_id": x_device_id,
+            "tx_id": tx_id
         }
-        return {
-            "status": "pending_admin_approval",
-            "transfer_id": transfer_id,
-            "amount": amount,
-            "destination": destination,
-            "request_id": request.state.request_id,
-        }
-
-    return {
-        "status": "transfer_approved",
-        "amount": amount,
-        "destination": destination,
-        "approved_by_role": request.state.role,
-        "risk_score": request.state.risk_score,
-        "request_id": request.state.request_id,
-    }
-
-
-# =========================================================
-# ADMIN ROUTES
-# =========================================================
-
-@app.get("/admin/pending-transfers")
-def pending_transfers(request: Request):
-    return {
-        "pending": list(PENDING_TRANSFERS.values()),
-        "count": len(PENDING_TRANSFERS),
-        "request_id": request.state.request_id,
-    }
-
-
-@app.post("/admin/approve-transfer")
-def approve_transfer(request: Request):
-    body = request.state.body or {}
-    transfer_id = body.get("transfer_id")
-    admin_secret = request.headers.get("x-admin-secret")
-
-    if not transfer_id:
-        raise HTTPException(status_code=400, detail="transfer_id required")
-
-    if admin_secret != DAVID_ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Admin secret required")
-
-    transfer = PENDING_TRANSFERS.get(transfer_id)
-    if not transfer:
-        raise HTTPException(status_code=404, detail="Transfer not found")
-
-    transfer["status"] = "approved"
-    transfer["approved_at"] = iso_now()
-    transfer["approved_by_role"] = request.state.role
-    transfer["approval_request_id"] = request.state.request_id
-
-    return {
-        "status": "approved",
-        "transfer": transfer,
-        "request_id": request.state.request_id,
-    }
-
-
-@app.post("/admin/issue-token")
-def issue_token(request: Request):
-    body = request.state.body or {}
-    role = body.get("role", "user")
-    ttl_minutes = int(body.get("ttl_minutes", 60))
-    one_time = bool(body.get("one_time", False))
-    label = body.get("label", "")
-
-    if role not in {"user", "admin"}:
-        raise HTTPException(status_code=400, detail="Invalid role")
-
-    if ttl_minutes < 1 or ttl_minutes > 43200:
-        raise HTTPException(status_code=400, detail="Invalid ttl_minutes")
-
-    token_record = make_token_record(
-        role=role,
-        ttl_minutes=ttl_minutes,
-        one_time=one_time,
-        label=label,
     )
 
     return {
-        "issued": True,
-        "token_record": token_record,
-        "request_id": request.state.request_id,
+        "status": "allowed",
+        "reason_code": "VERIFIED",
+        "risk_score": 0
     }
 
+# =========================
+# ATTACK SIMULATION
+# =========================
+@app.get("/attack")
+def attack():
+    log_event("DENIED", "SIMULATED_ATTACK", 98, {"mode": "fail_closed"})
+    return {"status": "blocked", "reason_code": "SIMULATED_ATTACK", "risk_score": 98}
 
-@app.post("/admin/revoke-token")
-def admin_revoke_token(request: Request):
-    body = request.state.body or {}
-    raw_token = body.get("token")
+# =========================
+# LOGS
+# =========================
+@app.get("/logs")
+def get_logs():
+    return {"logs": logs}
 
-    if not raw_token:
-        raise HTTPException(status_code=400, detail="token required")
+# =========================
+# ADMIN
+# =========================
+@app.get("/admin")
+def admin(key: str):
+    if key != ADMIN_KEY:
+        log_event("DENIED", "ADMIN_UNAUTHORIZED", 90, {})
+        return JSONResponse({"status": "blocked", "reason_code": "ADMIN_UNAUTHORIZED"}, status_code=403)
 
-    success = revoke_token(raw_token)
+    cleanup_expired_tokens()
+    cleanup_expired_dual_approvals()
 
     return {
-        "revoked": success,
-        "request_id": request.state.request_id,
+        "status": "ok",
+        "active_token_count": len(active_tokens),
+        "used_token_count": len(used_tokens),
+        "pending_dual_approvals": list(dual_approvals.keys()),
+        "recent_logs": logs[-20:]
     }
