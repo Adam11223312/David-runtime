@@ -1,3 +1,93 @@
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+
+app = FastAPI()
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+    <head>
+        <title>David Security System</title>
+        <style>
+            body {
+                font-family: Arial;
+                background: black;
+                color: lime;
+                text-align: center;
+            }
+            h1 { color: lime; }
+            input {
+                font-size: 20px;
+                padding: 10px;
+                width: 300px;
+                text-align: center;
+            }
+            button {
+                margin: 5px;
+                padding: 10px;
+                font-size: 18px;
+                width: 50px;
+                background: #111;
+                color: lime;
+                border: 1px solid lime;
+            }
+            .wide { width: 110px; }
+            .result { margin-top: 20px; font-size: 24px; }
+        </style>
+    </head>
+    <body>
+
+        <h1>DAVID SECURITY SYSTEM</h1>
+        <p>Status: ACTIVE | Mode: FAIL-CLOSED</p>
+
+        <input id="inputBox" placeholder="Enter Code..." readonly><br><br>
+
+        <div id="keyboard"></div>
+
+        <br>
+        <button class="wide" onclick="submitCode()">ENTER</button>
+        <button class="wide" onclick="clearInput()">CLEAR</button>
+
+        <div class="result" id="result"></div>
+
+        <script>
+            const keys = "1234567890QWERTYUIOPASDFGHJKLZXCVBNM";
+
+            const keyboard = document.getElementById("keyboard");
+
+            keys.split("").forEach(k => {
+                let btn = document.createElement("button");
+                btn.innerText = k;
+                btn.onclick = () => addChar(k);
+                keyboard.appendChild(btn);
+            });
+
+            function addChar(char) {
+                document.getElementById("inputBox").value += char;
+            }
+
+            function clearInput() {
+                document.getElementById("inputBox").value = "";
+                document.getElementById("result").innerText = "";
+            }
+
+            function submitCode() {
+                let value = document.getElementById("inputBox").value;
+
+                if (value === "DAVID123") {
+                    document.getElementById("result").innerText = "✅ ACCESS GRANTED";
+                    document.getElementById("result").style.color = "lime";
+                } else {
+                    document.getElementById("result").innerText = "❌ ACCESS DENIED";
+                    document.getElementById("result").style.color = "red";
+                }
+            }
+        </script>
+
+    </body>
+    </html>
+    """
 import os
 import time
 import json
