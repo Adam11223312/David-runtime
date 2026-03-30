@@ -22,7 +22,7 @@ def generate_token(user_id, role="user"):
 def validate_token(token):
     try:
         return jwt.decode(
-# =========================
+# ========================
 # Auth decorator
 # =========================
 def require_auth(admin_only=False):
