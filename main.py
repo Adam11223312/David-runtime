@@ -21,10 +21,7 @@ def generate_token(user_id, role="user"):
 
 def validate_token(token):
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-    except Exception:
-        return None
-
+        return jwt.decode(
 # =========================
 # Auth decorator
 # =========================
