@@ -4,24 +4,22 @@ import time
 from functools import wraps
 from collections import defaultdict
 import datetime
-import os
 
 app = Flask(__name__)
 
 # =========================
 # CONFIG
 # =========================
-SECRET_KEY = "supersecretkey_for_jwt"  # change for production
-TOKEN_EXPIRY_SECONDS = 300  # 5 minutes
+SECRET_KEY = "supersecretkey_for_jwt"
+TOKEN_EXPIRY_SECONDS = 300  # 5 min tokens
 RATE_LIMIT = 5  # max requests per RATE_PERIOD per IP
 RATE_PERIOD = 10
 QR_ROTATION_INTERVAL = 60  # seconds
+MAX_JSON_SIZE = 1024 * 50  # 50 KB max payload
 
-# Track IP requests for brute-force prevention
+# Track IP requests and blocks
 ip_requests = defaultdict(list)
 blocked_ips = defaultdict(float)
-
-# Rotating QR code stub
 current_qr_code = "INITIAL_QR_CODE"
 
 # =========================
@@ -39,7 +37,7 @@ def rate_limited(ip):
         return True
     ip_requests[ip] = [t for t in ip_requests[ip] if now - t < RATE_PERIOD]
     if len(ip_requests[ip]) >= RATE_LIMIT:
-        blocked_ips[ip] = now + 30  # block 30s
+        blocked_ips[ip] = now + 30
         ip_requests[ip] = []
         return True
     ip_requests[ip].append(now)
@@ -55,15 +53,12 @@ def generate_token(user_id, role="user"):
 
 def validate_token(token):
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        return payload
-    except jwt.ExpiredSignatureError:
-        return None
-    except jwt.InvalidTokenError:
+        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
         return None
 
-def is_admin(token_payload):
-    return token_payload.get("role") == "admin"
+def is_admin(payload):
+    return payload.get("role") == "admin"
 
 def require_auth(admin_only=False):
     def decorator(f):
@@ -71,25 +66,20 @@ def require_auth(admin_only=False):
         def wrapper(*args, **kwargs):
             ip = request.remote_addr
             if rate_limited(ip):
-                time.sleep(1)
                 return jsonify({"error": "Too many requests or blocked"}), 429
 
             auth_header = request.headers.get("Authorization", "")
             if not auth_header.startswith("Bearer "):
-                time.sleep(0.5)
                 return jsonify({"error": "Unauthorized"}), 401
 
             token = auth_header.split(" ")[1]
             payload = validate_token(token)
             if not payload:
-                time.sleep(0.5)
                 return jsonify({"error": "Invalid or expired token"}), 403
 
             if admin_only and not is_admin(payload):
-                time.sleep(0.5)
                 return jsonify({"error": "Admin only"}), 403
 
-            print(f"[ACCESS GRANTED] IP: {ip} User: {payload.get('user_id')} Role: {payload.get('role')}")
             return f(payload, *args, **kwargs)
         return wrapper
     return decorator
@@ -119,41 +109,47 @@ def admin_route(payload):
 @require_auth(admin_only=False)
 def test_endpoint(payload):
     ip = request.remote_addr
+
+    # Limit JSON size to prevent server crash
+    if request.content_length and request.content_length > MAX_JSON_SIZE:
+        return jsonify({"error": "Payload too large"}), 413
+
     try:
         data = request.get_json(force=True)
     except Exception as e:
-        print(f"[ERROR] JSON parse failed: {e}")
         return jsonify({"error": "Malformed JSON"}), 400
 
-    try:
-        results = []
-        actions = data.get("actions", [])
-        for action in actions:
-            if action.get("type") == "bank_transfer":
-                results.append({"bank_transfer": "blocked" if action.get("amount",0) > 1000000 else "allowed"})
-            elif action.get("type") == "system_override":
+    results = []
+    actions = data.get("actions", [])
+    for action in actions:
+        try:
+            action_type = action.get("type", "unknown")
+            if action_type == "bank_transfer":
+                amount = action.get("amount", 0)
+                results.append({"bank_transfer": "blocked" if amount > 1000000 else "allowed"})
+            elif action_type == "system_override":
                 dual_auth = action.get("parameters", {}).get("dual_auth", {})
                 results.append({"system_override": dual_auth})
-            elif action.get("type") == "nested_check":
+            elif action_type == "nested_check":
                 sub_results = []
                 for p in action.get("payload", []):
                     token_valid = None
                     if "token" in p:
-                        token_valid = validate_token(p["token"]) is not None
+                        token_valid = validate_token(p.get("token")) is not None
                     sanitized = "<script" not in str(p.get("data",""))
                     sub_results.append({"token_valid": token_valid, "sanitized": sanitized})
                 results.append({"nested_check": sub_results})
             else:
-                results.append({"unknown_action": action.get("type")})
-        return jsonify({
-            "results": results,
-            "user_id": payload.get("user_id"),
-            "role": payload.get("role"),
-            "ip": ip
-        })
-    except Exception as e:
-        print(f"[ERROR] Test processing failed: {e}")
-        return jsonify({"error": "Server error"}), 500
+                results.append({"unknown_action": action_type})
+        except Exception as e:
+            results.append({"error": f"Action processing failed: {e}"})
+
+    return jsonify({
+        "results": results,
+        "user_id": payload.get("user_id"),
+        "role": payload.get("role"),
+        "ip": ip
+    })
 
 @app.route("/token/<user_id>/<role>", methods=["GET"])
 def get_token(user_id, role):
@@ -166,10 +162,8 @@ def keyboard_input(payload):
     try:
         data = request.get_json(force=True)
         key = data.get("key")
-        print(f"[KEYBOARD INPUT] User: {payload.get('user_id')} Key: {key}")
         return jsonify({"received_key": key})
-    except Exception as e:
-        print(f"[ERROR] Keyboard input failed: {e}")
+    except Exception:
         return jsonify({"error": "Malformed input"}), 400
 
 @app.errorhandler(404)
