@@ -660,7 +660,20 @@ def get_logs():
 # =========================
 # ADMIN
 # =========================
-@app.get("/admin")
+@app.route("/admin", methods=["GET", "POST"])
+def admin():
+    token = request.headers.get("Authorization")
+
+    if not token:
+        return {"error": "Unauthorized"}, 401
+
+    if not validate_token(token):
+        return {"error": "Invalid token"}, 403
+
+    if not is_admin(token):
+        return {"error": "Admin only"}, 403
+
+    return {"status": "admin access granted"}@app.get("/admin")
 def admin(key: str):
     if key != ADMIN_KEY:
         log_event("DENIED", "ADMIN_UNAUTHORIZED", 90, {})
