@@ -1,15 +1,15 @@
 from flask import Flask, request, jsonify
 import jwt
-import time
-from functools import wraps
 import datetime
+from functools import wraps
+import os
 
 app = Flask(__name__)
 
 SECRET_KEY = "supersecretkey_for_jwt"
 
 # =========================
-# SAFE TOKEN
+# Token helpers
 # =========================
 def generate_token(user_id, role="user"):
     payload = {
@@ -26,7 +26,7 @@ def validate_token(token):
         return None
 
 # =========================
-# SAFE AUTH
+# Auth decorator
 # =========================
 def require_auth(admin_only=False):
     def decorator(f):
@@ -34,21 +34,15 @@ def require_auth(admin_only=False):
         def wrapper(*args, **kwargs):
             try:
                 auth = request.headers.get("Authorization", "")
-
                 if not auth.startswith("Bearer "):
                     return jsonify({"error": "Unauthorized"}), 401
-
                 token = auth.split(" ")[1]
                 payload = validate_token(token)
-
                 if not payload:
                     return jsonify({"error": "Invalid token"}), 403
-
                 if admin_only and payload.get("role") != "admin":
                     return jsonify({"error": "Admin only"}), 403
-
                 return f(payload, *args, **kwargs)
-
             except Exception as e:
                 print("[AUTH ERROR]", e)
                 return jsonify({"error": "Auth failure"}), 500
@@ -56,9 +50,8 @@ def require_auth(admin_only=False):
     return decorator
 
 # =========================
-# ROUTES
+# Routes
 # =========================
-
 @app.route("/")
 def home():
     return "David Running"
@@ -79,70 +72,52 @@ def admin(payload):
 @require_auth()
 def test(payload):
     try:
-        data = request.get_json(silent=True)
-
-        # if no json, don't crash
-        if not isinstance(data, dict):
-            return jsonify({"error": "Invalid JSON"}), 400
-
+        data = request.get_json(silent=True) or {}
         actions = data.get("actions", [])
         if not isinstance(actions, list):
             actions = []
-
         results = []
-
         for action in actions:
             if not isinstance(action, dict):
                 results.append({"error": "bad action"})
                 continue
-
-            t = action.get("type")
-
+            t = action.get("type", "unknown")
             if t == "bank_transfer":
                 amt = action.get("amount", 0)
                 results.append({
-                    "bank_transfer": "blocked" if isinstance(amt, (int, float)) and amt > 1000000 else "allowed"
+                    "bank_transfer": "blocked" if isinstance(amt,(int,float)) and amt > 1000000 else "allowed"
                 })
-
             elif t == "nested_check":
                 sub = action.get("payload", [])
                 if not isinstance(sub, list):
                     sub = []
-
                 sub_results = []
-
                 for p in sub:
                     if not isinstance(p, dict):
                         sub_results.append({"error": "bad sub"})
                         continue
-
                     token_valid = None
                     if "token" in p:
                         token_valid = validate_token(p.get("token")) is not None
-
-                    sanitized = "<script" not in str(p.get("data", ""))
-
+                    sanitized = "<script" not in str(p.get("data",""))
                     sub_results.append({
                         "token_valid": token_valid,
                         "sanitized": sanitized
                     })
-
                 results.append({"nested": sub_results})
-
             else:
                 results.append({"unknown": str(t)})
-
         return jsonify({
             "results": results,
             "user": payload.get("user_id")
         })
-
     except Exception as e:
         print("[TEST ERROR]", e)
         return jsonify({"error": "safe failure"}), 500
 
 # =========================
-# RUN
+# Run
 # =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
