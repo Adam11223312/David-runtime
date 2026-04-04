@@ -99,30 +99,4 @@ def listen_keyboard():
     print("Keyboard listener started. Press ESC to exit.")
     while True:
         try:
-            if keyboard.is_pressed('esc'):
-                print("Exiting...")
-                os._exit(0)
-            # Add custom key interactions here
-        except:
-            pass
-        time.sleep(0.05)
-
-# -----------------------
-# Main Loop
-# -----------------------
-def main():
-    # Start keyboard listener in a thread
-    threading.Thread(target=listen_keyboard, daemon=True).start()
-
-    speak("Hello! I am David, ready to assist you.")
-
-    while True:
-        show_avatar()
-        # Example QR code generation
-        qr_file = generate_qr("David AI Operational")
-        print(f"Generated QR code: {qr_file}")
-        speak("QR code updated.")
-        time.sleep(10)  # Rotate QR code every 10 seconds
-
-if __name__ == "__main__":
-    main()
+            if keyboard.is_pressed('
