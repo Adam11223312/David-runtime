@@ -1,4 +1,4 @@
-# main.py - David AI Conversational Full System (No visuals)
+main.py - David AI Conversational Full System (No visuals)
 
 import threading
 import time
