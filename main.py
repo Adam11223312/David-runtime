@@ -4,24 +4,6 @@ import datetime
 from functools import wraps
 import os
 
-app = Flask(__name__)
-
-SECRET_KEY = "supersecretkey_for_jwt"
-
-# =========================
-# Token helpers
-# =========================
-def generate_token(user_id, role="user"):
-    payload = {
-        "user_id": user_id,
-        "role": role,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=5)
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-
-def validate_token(token):
-    try:
-        return jwt.decode(
 # ========================
 # Auth decorator
 # =========================
