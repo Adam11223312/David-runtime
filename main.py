@@ -1,235 +1,170 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import secrets, time, asyncio
+import os
+import sys
+import json
+import time
+import threading
+import platform
+import qrcode
+from uuid import uuid4
 
-app = FastAPI(title="David AI Governance System")
+# -------------- AI & Voice --------------
+import openai
+import sounddevice as sd
+import numpy as np
+import wavio
+import speech_recognition as sr
+import pyttsx3
 
-# --- CORS ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+# --------------- 3D Rendering -------------
+import pyglet
+from pyglet.gl import *
 
-# --- In-memory stores ---
-tokens = {}  # token: device_id
-sessions = {}  # device_id: list of commands
-audit_logs = []  # list of dicts
-risk_threshold = 70  # 0-100
+# -------------- Gesture Recognition --------------
+import cv2
 
-# --- Models ---
-class Command(BaseModel):
-    token: str
-    device_id: str
-    command: str
-    reason: str
-    risk_score: int
+# --------------- Keyboard Input ----------------
+from pynput import keyboard
 
-# --- Helpers ---
-def generate_token(device_id):
-    token = secrets.token_hex(16)
-    tokens[token] = device_id
-    return token
+# --------------- Governance & Security -----------
+from datetime import datetime
 
-def verify_token(token, device_id):
-    return tokens.get(token) == device_id
+# ========== LOAD CONFIGS ==========
+CONFIG_PATH = "config/settings.json"
+GOV_PATH = "config/governance.json"
 
-def log_action(device_id, command, reason, risk_score, result):
-    audit_logs.append({
-        "timestamp": time.time(),
-        "device_id": device_id,
-        "command": command,
-        "reason": reason,
-        "risk_score": risk_score,
-        "result": result
-    })
+def load_json(p):
+    if os.path.exists(p):
+        return json.load(open(p))
+    return {}
 
-def fail_closed(command_obj: Command):
-    if command_obj.risk_score > risk_threshold:
-        log_action(command_obj.device_id, command_obj.command,
-                   command_obj.reason, command_obj.risk_score, "BLOCKED")
-        return False, "Blocked due to high risk"
-    return True, "Allowed"
+settings = load_json(CONFIG_PATH)
+governance = load_json(GOV_PATH)
 
-# --- Routes ---
-@app.get("/", response_class=HTMLResponse)
-async def ui():
-    return """
-<html>
-<head>
-    <title>David AI Governance System</title>
-    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500&display=swap" rel="stylesheet">
-    <style>
-        body { 
-            font-family: 'Orbitron', monospace; 
-            background: radial-gradient(circle at top, #000010, #000000); 
-            color: #0ff; 
-            margin: 0; 
-            padding: 20px; 
-        }
-        h1, h2 { text-align: center; color: #0ff; text-shadow: 0 0 10px #0ff; }
-        form { 
-            max-width: 500px; 
-            margin: 20px auto; 
-            padding: 20px; 
-            background: rgba(0,0,0,0.7); 
-            border: 2px solid #0ff; 
-            border-radius: 10px; 
-        }
-        input, button { 
-            width: 100%; 
-            padding: 10px; 
-            margin: 5px 0; 
-            border-radius: 5px; 
-            border: 1px solid #0ff; 
-            background: #111; 
-            color: #0ff; 
-            font-family: 'Orbitron', monospace;
-        }
-        button { 
-            background: #0ff; 
-            color: #000; 
-            font-weight: bold; 
-            cursor: pointer; 
-        }
-        #logs { 
-            max-height: 300px; 
-            overflow-y: scroll; 
-            border: 2px solid #0ff; 
-            padding: 10px; 
-            background: #111; 
-            border-radius: 10px; 
-            font-family: 'Orbitron', monospace;
-        }
-        #voiceSphere {
-            width: 120px; 
-            height: 120px; 
-            border-radius: 50%; 
-            background: radial-gradient(circle at center, #0ff, #004); 
-            margin: 20px auto; 
-            box-shadow: 0 0 30px #0ff, 0 0 50px #0ff inset;
-            animation: pulse 2s infinite;
-            position: relative;
-        }
-        #voiceSphere::before, #voiceSphere::after {
-            content: '';
-            position: absolute;
-            width: 100%; height: 100%;
-            border-radius: 50%;
-            top: 0; left: 0;
-            box-shadow: 0 0 10px #f0f, 0 0 20px #0ff inset;
-            animation: glitch 1s infinite linear alternate-reverse;
-        }
-        @keyframes pulse {
-            0% { transform: scale(1); box-shadow: 0 0 30px #0ff, 0 0 50px #0ff inset; }
-            50% { transform: scale(1.2); box-shadow: 0 0 50px #0ff, 0 0 70px #0ff inset; }
-            100% { transform: scale(1); box-shadow: 0 0 30px #0ff, 0 0 50px #0ff inset; }
-        }
-        @keyframes glitch {
-            0% { transform: translate(0,0) rotate(0deg); opacity:1; }
-            25% { transform: translate(2px,-2px) rotate(1deg); opacity:0.8; }
-            50% { transform: translate(-2px,2px) rotate(-1deg); opacity:0.9; }
-            75% { transform: translate(1px,-1px) rotate(0.5deg); opacity:0.7; }
-            100% { transform: translate(0,0) rotate(0deg); opacity:1; }
-        }
-    </style>
-</head>
-<body>
-    <h1>David AI Governance System</h1>
-    <div id="voiceSphere"></div>
+# ========== OPENAI SETUP ==========
+openai.api_key = os.getenv("OPENAI_API_KEY", settings.get("openai_api_key", ""))
 
-    <h2>Command Console</h2>
-    <form id="cmdForm">
-        Token: <input type="text" id="token" placeholder="Paste your token here"><br>
-        Device ID: <input type="text" id="device" placeholder="Your device ID"><br>
-        Command: <input type="text" id="command" placeholder="Enter command"><br>
-        Reason: <input type="text" id="reason" placeholder="Reason for command"><br>
-        Risk Score: <input type="number" id="risk" min="0" max="100" placeholder="0-100"><br>
-        <button type="submit">Send</button>
-    </form>
+# ========== SPEECH ENGINE ==========
+engine = pyttsx3.init()
+engine.setProperty("rate", settings.get("tts_rate", 145))
 
-    <h2>Audit Logs</h2>
-    <div id="logs"></div>
+# ====== VOICE INPUT FUNCTION ======
+recognizer = sr.Recognizer()
 
-    <script>
-        const form = document.getElementById('cmdForm');
-        const logsDiv = document.getElementById('logs');
-        const sphere = document.getElementById('voiceSphere');
+def listen_voice():
+    with sr.Microphone() as mic:
+        print("[Voice] Listening...")
+        audio = recognizer.listen(mic, timeout=5)
+    try:
+        text = recognizer.recognize_google(audio)
+        print(f"[Voice Recognized]: {text}")
+        return text
+    except:
+        return ""
 
-        form.addEventListener('submit', async e => {
-            e.preventDefault();
-            const riskInput = document.getElementById('risk').value;
-            const riskScore = parseInt(riskInput);
-            if (isNaN(riskScore)) {
-                alert("Risk Score must be a number between 0 and 100");
-                return;
-            }
-            const data = {
-                token: document.getElementById('token').value.trim(),
-                device_id: document.getElementById('device').value.trim(),
-                command: document.getElementById('command').value.trim(),
-                reason: document.getElementById('reason').value.trim(),
-                risk_score: riskScore
-            };
-            try {
-                const res = await fetch('/execute', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data)
-                });
-                const result = await res.json();
-                logsDiv.innerHTML = `<pre>${JSON.stringify(result, null, 2)}</pre>` + logsDiv.innerHTML;
+# ====== SPEAK =========
+def speak(text):
+    engine.say(text)
+    engine.runAndWait()
 
-                if (result.status === "success") {
-                    const utterance = new SpeechSynthesisUtterance(result.message);
-                    utterance.lang = 'en-US';
-                    utterance.pitch = 1.2;
-                    utterance.rate = 1.0;
-                    speechSynthesis.speak(utterance);
+# ====== AI QUERY =========
+def ai_query(prompt):
+    resp = openai.Completion.create(
+        model=settings.get("openai_model", "gpt-4o-mini"),
+        prompt=prompt,
+        max_tokens=settings.get("max_tokens", 180),
+    )
+    return resp.choices[0].text.strip()
 
-                    sphere.style.animation = 'pulse 1s infinite';
-                    utterance.onend = () => { sphere.style.animation = 'pulse 2s infinite'; }
-                }
+# ====== ROTATING QR SECURITY =========
+def make_qr_token():
+    token = str(uuid4())
+    qr = qrcode.make(token)
+    out = os.path.join("assets", "qrcodes", f"{token}.png")
+    qr.save(out)
+    print(f"[QR] Generated token {token}")
+    return token, out
 
-            } catch (err) {
-                alert("Error communicating with David: " + err);
-            }
-        });
-    </script>
-</body>
-</html>
-"""
+# ========== 3D AVATAR SETUP ==========
+window = pyglet.window.Window(width=800, height=600)
+@window.event
+def on_draw():
+    window.clear()
+    # Simple rotating cube as avatar stand-in
+    glRotatef(1, 3, 1, 0)
+    pyglet.graphics.draw(8, GL_QUADS,
+        ('v3f', [
+            -50, -50, -50,  50, -50, -50,  50, 50, -50,  -50, 50, -50,
+            -50, -50,  50,  50, -50,  50,  50, 50,  50,  -50, 50,  50,
+        ])
+    )
 
-# --- Command execution endpoint ---
-@app.post("/execute")
-async def execute(cmd: Command):
-    if not verify_token(cmd.token, cmd.device_id):
-        return JSONResponse({"status": "error", "message": "Invalid token/device"}, status_code=403)
-    
-    allowed, message = fail_closed(cmd)
-    if not allowed:
-        return {"status": "blocked", "message": message}
+# ========== GESTURE RECOGNITION ==========
+cap = cv2.VideoCapture(0)
 
-    # Store session
-    session_ctx = sessions.get(cmd.device_id, [])
-    session_ctx.append({"command": cmd.command, "reason": cmd.reason})
-    sessions[cmd.device_id] = session_ctx
+def get_gesture():
+    ret, frame = cap.read()
+    if not ret:
+        return ""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Placeholder gesture detection
+    if np.mean(gray) > 90:
+        return "open_hand"
+    return ""
 
-    # Log action
-    log_action(cmd.device_id, cmd.command, cmd.reason, cmd.risk_score, "EXECUTED")
+# ========== KEYBOARD HANDLING ==========
+typed_buffer = ""
 
-    return {"status": "success", "message": f"Command executed: {cmd.command}", "session_context": session_ctx}
+def on_key_press(key):
+    global typed_buffer
+    try:
+        if hasattr(key, "char"):
+            typed_buffer += key.char
+        if key == keyboard.Key.enter:
+            process_text(typed_buffer.strip())
+            typed_buffer = ""
+    except:
+        pass
 
-# --- Token generation endpoint ---
-@app.get("/generate_token/{device_id}")
-async def get_token(device_id: str):
-    token = generate_token(device_id)
-    return {"token": token}
+listener = keyboard.Listener(on_press=on_key_press)
+listener.start()
 
-# --- Audit logs endpoint ---
-@app.get("/audit")
-async def get_audit():
-    return {"audit_logs": audit_logs}
+# ========== GOVERNANCE CHECK ==========
+def check_governance(prompt):
+    banned_words = governance.get("banned_words", [])
+    for w in banned_words:
+        if w.lower() in prompt.lower():
+            speak("I can't do that.")
+            return False
+    return True
+
+# ========== PROCESS TEXT ==========
+def process_text(text):
+    if not text:
+        return
+    print(f"[User] {text}")
+    if not check_governance(text):
+        return
+    answer = ai_query(text)
+    print(f"[AI] {answer}")
+    speak(answer)
+
+# ========== MAIN LOOP ==========
+
+def voice_loop():
+    while True:
+        v = listen_voice()
+        if v:
+            process_text(v)
+
+def qr_loop():
+    while True:
+        token, path = make_qr_token()
+        time.sleep(settings.get("qr_interval", 60))
+
+if __name__ == "__main__":
+    # Start background tasks
+    threading.Thread(target=voice_loop, daemon=True).start()
+    threading.Thread(target=qr_loop, daemon=True).start()
+
+    print("[David] Initialized.")
+    pyglet.app.run()
