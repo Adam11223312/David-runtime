@@ -1,170 +1,128 @@
+# main.py - David AI Ready-to-Run
+
 import os
 import sys
-import json
-import time
 import threading
-import platform
-import qrcode
-from uuid import uuid4
+import time
 
-# -------------- AI & Voice --------------
-import openai
-import sounddevice as sd
-import numpy as np
-import wavio
-import speech_recognition as sr
-import pyttsx3
+# -----------------------
+# Safe imports
+# -----------------------
+try:
+    import qrcode
+except ImportError:
+    print("QR code module missing. Installing...")
+    os.system(f"{sys.executable} -m pip install qrcode[pil] pillow")
+    import qrcode
 
-# --------------- 3D Rendering -------------
-import pyglet
-from pyglet.gl import *
+try:
+    from PIL import Image
+except ImportError:
+    print("PIL missing. Installing...")
+    os.system(f"{sys.executable} -m pip install pillow")
+    from PIL import Image
 
-# -------------- Gesture Recognition --------------
-import cv2
+try:
+    import pyttsx3  # Voice engine
+except ImportError:
+    print("pyttsx3 missing. Installing...")
+    os.system(f"{sys.executable} -m pip install pyttsx3")
+    import pyttsx3
 
-# --------------- Keyboard Input ----------------
-from pynput import keyboard
+try:
+    import keyboard  # QWERTY input
+except ImportError:
+    print("keyboard module missing. Installing...")
+    os.system(f"{sys.executable} -m pip install keyboard")
+    import keyboard
 
-# --------------- Governance & Security -----------
-from datetime import datetime
+try:
+    import cv2  # For avatar/face display
+except ImportError:
+    print("opencv missing. Installing...")
+    os.system(f"{sys.executable} -m pip install opencv-python")
+    import cv2
 
-# ========== LOAD CONFIGS ==========
-CONFIG_PATH = "config/settings.json"
-GOV_PATH = "config/governance.json"
+# -----------------------
+# Global Settings
+# -----------------------
+VOICE_RATE = 150
+QR_CODE_DIR = "qrcodes"
+AVATAR_IMAGE = "avatar.png"  # replace with your face/avatar
 
-def load_json(p):
-    if os.path.exists(p):
-        return json.load(open(p))
-    return {}
+if not os.path.exists(QR_CODE_DIR):
+    os.makedirs(QR_CODE_DIR)
 
-settings = load_json(CONFIG_PATH)
-governance = load_json(GOV_PATH)
-
-# ========== OPENAI SETUP ==========
-openai.api_key = os.getenv("OPENAI_API_KEY", settings.get("openai_api_key", ""))
-
-# ========== SPEECH ENGINE ==========
+# -----------------------
+# Voice Engine Setup
+# -----------------------
 engine = pyttsx3.init()
-engine.setProperty("rate", settings.get("tts_rate", 145))
+engine.setProperty('rate', VOICE_RATE)
 
-# ====== VOICE INPUT FUNCTION ======
-recognizer = sr.Recognizer()
-
-def listen_voice():
-    with sr.Microphone() as mic:
-        print("[Voice] Listening...")
-        audio = recognizer.listen(mic, timeout=5)
-    try:
-        text = recognizer.recognize_google(audio)
-        print(f"[Voice Recognized]: {text}")
-        return text
-    except:
-        return ""
-
-# ====== SPEAK =========
 def speak(text):
     engine.say(text)
     engine.runAndWait()
 
-# ====== AI QUERY =========
-def ai_query(prompt):
-    resp = openai.Completion.create(
-        model=settings.get("openai_model", "gpt-4o-mini"),
-        prompt=prompt,
-        max_tokens=settings.get("max_tokens", 180),
+# -----------------------
+# QR Code Generator
+# -----------------------
+def generate_qr(data, filename=None):
+    if not filename:
+        filename = os.path.join(QR_CODE_DIR, f"qr_{int(time.time())}.png")
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
     )
-    return resp.choices[0].text.strip()
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    img.save(filename)
+    return filename
 
-# ====== ROTATING QR SECURITY =========
-def make_qr_token():
-    token = str(uuid4())
-    qr = qrcode.make(token)
-    out = os.path.join("assets", "qrcodes", f"{token}.png")
-    qr.save(out)
-    print(f"[QR] Generated token {token}")
-    return token, out
-
-# ========== 3D AVATAR SETUP ==========
-window = pyglet.window.Window(width=800, height=600)
-@window.event
-def on_draw():
-    window.clear()
-    # Simple rotating cube as avatar stand-in
-    glRotatef(1, 3, 1, 0)
-    pyglet.graphics.draw(8, GL_QUADS,
-        ('v3f', [
-            -50, -50, -50,  50, -50, -50,  50, 50, -50,  -50, 50, -50,
-            -50, -50,  50,  50, -50,  50,  50, 50,  50,  -50, 50,  50,
-        ])
-    )
-
-# ========== GESTURE RECOGNITION ==========
-cap = cv2.VideoCapture(0)
-
-def get_gesture():
-    ret, frame = cap.read()
-    if not ret:
-        return ""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    # Placeholder gesture detection
-    if np.mean(gray) > 90:
-        return "open_hand"
-    return ""
-
-# ========== KEYBOARD HANDLING ==========
-typed_buffer = ""
-
-def on_key_press(key):
-    global typed_buffer
-    try:
-        if hasattr(key, "char"):
-            typed_buffer += key.char
-        if key == keyboard.Key.enter:
-            process_text(typed_buffer.strip())
-            typed_buffer = ""
-    except:
-        pass
-
-listener = keyboard.Listener(on_press=on_key_press)
-listener.start()
-
-# ========== GOVERNANCE CHECK ==========
-def check_governance(prompt):
-    banned_words = governance.get("banned_words", [])
-    for w in banned_words:
-        if w.lower() in prompt.lower():
-            speak("I can't do that.")
-            return False
-    return True
-
-# ========== PROCESS TEXT ==========
-def process_text(text):
-    if not text:
+# -----------------------
+# Avatar Display (OpenCV)
+# -----------------------
+def show_avatar():
+    if not os.path.exists(AVATAR_IMAGE):
+        print("Avatar image not found. Please add your avatar.png in the folder.")
         return
-    print(f"[User] {text}")
-    if not check_governance(text):
-        return
-    answer = ai_query(text)
-    print(f"[AI] {answer}")
-    speak(answer)
+    img = cv2.imread(AVATAR_IMAGE)
+    cv2.imshow("David AI", img)
+    cv2.waitKey(1)  # Required to refresh the window
 
-# ========== MAIN LOOP ==========
-
-def voice_loop():
+# -----------------------
+# Keyboard Listener Thread
+# -----------------------
+def listen_keyboard():
+    print("Keyboard listener started. Press ESC to exit.")
     while True:
-        v = listen_voice()
-        if v:
-            process_text(v)
+        try:
+            if keyboard.is_pressed('esc'):
+                print("Exiting...")
+                os._exit(0)
+            # Add custom key interactions here
+        except:
+            pass
+        time.sleep(0.05)
 
-def qr_loop():
+# -----------------------
+# Main Loop
+# -----------------------
+def main():
+    # Start keyboard listener in a thread
+    threading.Thread(target=listen_keyboard, daemon=True).start()
+
+    speak("Hello! I am David, ready to assist you.")
+
     while True:
-        token, path = make_qr_token()
-        time.sleep(settings.get("qr_interval", 60))
+        show_avatar()
+        # Example QR code generation
+        qr_file = generate_qr("David AI Operational")
+        print(f"Generated QR code: {qr_file}")
+        speak("QR code updated.")
+        time.sleep(10)  # Rotate QR code every 10 seconds
 
 if __name__ == "__main__":
-    # Start background tasks
-    threading.Thread(target=voice_loop, daemon=True).start()
-    threading.Thread(target=qr_loop, daemon=True).start()
-
-    print("[David] Initialized.")
-    pyglet.app.run()
+    main()
