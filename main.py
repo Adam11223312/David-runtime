@@ -1,102 +1,161 @@
-from flask import Flask, request, jsonify
-import jwt
-import datetime
-from functools import wraps
-import os
+# main.py
+from fastapi import FastAPI, Request, HTTPException, Form
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import secrets, time, asyncio
 
-# ========================
-# Auth decorator
-# =========================
-def require_auth(admin_only=False):
-    def decorator(f):
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            try:
-                auth = request.headers.get("Authorization", "")
-                if not auth.startswith("Bearer "):
-                    return jsonify({"error": "Unauthorized"}), 401
-                token = auth.split(" ")[1]
-                payload = validate_token(token)
-                if not payload:
-                    return jsonify({"error": "Invalid token"}), 403
-                if admin_only and payload.get("role") != "admin":
-                    return jsonify({"error": "Admin only"}), 403
-                return f(payload, *args, **kwargs)
-            except Exception as e:
-                print("[AUTH ERROR]", e)
-                return jsonify({"error": "Auth failure"}), 500
-        return wrapper
-    return decorator
+app = FastAPI(title="David AI Governance System")
 
-# =========================
-# Routes
-# =========================
-@app.route("/")
-def home():
-    return "David Running"
+# --- CORS for UI ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # adjust for deployment
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
-@app.route("/token/<user>/<role>")
-def token(user, role):
-    return jsonify({"token": generate_token(user, role)})
+# --- In-memory stores ---
+tokens = {}  # token: device_id
+device_proofs = {}  # device_id: proof
+sessions = {}  # session_id: context
+audit_logs = []  # list of dicts
+risk_threshold = 70  # 0-100
 
-@app.route("/admin")
-@require_auth(admin_only=True)
-def admin(payload):
-    return jsonify({
-        "status": "admin ok",
-        "user": payload.get("user_id")
-    })
+# --- Models ---
+class Command(BaseModel):
+    token: str
+    device_id: str
+    command: str
+    reason: str
+    risk_score: int
 
-@app.route("/test", methods=["POST"])
-@require_auth()
-def test(payload):
-    try:
-        data = request.get_json(silent=True) or {}
-        actions = data.get("actions", [])
-        if not isinstance(actions, list):
-            actions = []
-        results = []
-        for action in actions:
-            if not isinstance(action, dict):
-                results.append({"error": "bad action"})
-                continue
-            t = action.get("type", "unknown")
-            if t == "bank_transfer":
-                amt = action.get("amount", 0)
-                results.append({
-                    "bank_transfer": "blocked" if isinstance(amt,(int,float)) and amt > 1000000 else "allowed"
-                })
-            elif t == "nested_check":
-                sub = action.get("payload", [])
-                if not isinstance(sub, list):
-                    sub = []
-                sub_results = []
-                for p in sub:
-                    if not isinstance(p, dict):
-                        sub_results.append({"error": "bad sub"})
-                        continue
-                    token_valid = None
-                    if "token" in p:
-                        token_valid = validate_token(p.get("token")) is not None
-                    sanitized = "<script" not in str(p.get("data",""))
-                    sub_results.append({
-                        "token_valid": token_valid,
-                        "sanitized": sanitized
-                    })
-                results.append({"nested": sub_results})
-            else:
-                results.append({"unknown": str(t)})
-        return jsonify({
-            "results": results,
-            "user": payload.get("user_id")
-        })
-    except Exception as e:
-        print("[TEST ERROR]", e)
-        return jsonify({"error": "safe failure"}), 500
+# --- Helpers ---
+def generate_token(device_id):
+    token = secrets.token_hex(16)
+    tokens[token] = device_id
+    return token
 
-# =========================
-# Run
-# =========================
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+def verify_token(token, device_id):
+    valid_device = tokens.get(token)
+    if valid_device != device_id:
+        return False
+    return True
+
+def log_action(device_id, command, reason, risk_score, result):
+    log_entry = {
+        "timestamp": time.time(),
+        "device_id": device_id,
+        "command": command,
+        "reason": reason,
+        "risk_score": risk_score,
+        "result": result
+    }
+    audit_logs.append(log_entry)
+
+def fail_closed(command_obj: Command):
+    if command_obj.risk_score > risk_threshold:
+        log_action(command_obj.device_id, command_obj.command,
+                   command_obj.reason, command_obj.risk_score, "BLOCKED")
+        return False, "Blocked due to high risk"
+    return True, "Allowed"
+
+# --- Routes ---
+@app.get("/", response_class=HTMLResponse)
+async def ui():
+    return """
+    <html>
+    <head>
+        <title>David AI Governance UI</title>
+        <style>
+            body { font-family: Arial; margin: 20px; }
+            #logs { max-height: 300px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px; }
+        </style>
+    </head>
+    <body>
+        <h1>David AI Governance System</h1>
+        <h2>Command Console</h2>
+        <form id="cmdForm">
+            Token: <input type="text" id="token"><br>
+            Device ID: <input type="text" id="device"><br>
+            Command: <input type="text" id="command"><br>
+            Reason: <input type="text" id="reason"><br>
+            Risk Score: <input type="number" id="risk" min="0" max="100"><br>
+            <button type="submit">Send</button>
+        </form>
+        <h2>Audit Logs</h2>
+        <div id="logs"></div>
+        <script>
+            const form = document.getElementById('cmdForm');
+            const logsDiv = document.getElementById('logs');
+            form.addEventListener('submit', async e => {
+                e.preventDefault();
+                const data = {
+                    token: document.getElementById('token').value,
+                    device_id: document.getElementById('device').value,
+                    command: document.getElementById('command').value,
+                    reason: document.getElementById('reason').value,
+                    risk_score: parseInt(document.getElementById('risk').value)
+                };
+                const res = await fetch('/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+                const result = await res.json();
+                logsDiv.innerHTML = `<pre>${JSON.stringify(result, null, 2)}</pre>` + logsDiv.innerHTML;
+            });
+        </script>
+    </body>
+    </html>
+    """
+
+@app.post("/execute")
+async def execute(cmd: Command):
+    # Verify token & device
+    if not verify_token(cmd.token, cmd.device_id):
+        return JSONResponse({"status": "error", "message": "Invalid token/device"}, status_code=403)
+    
+    # Fail-closed check
+    allowed, message = fail_closed(cmd)
+    if not allowed:
+        return {"status": "blocked", "message": message}
+
+    # Simulate command execution & session context
+    session_ctx = sessions.get(cmd.device_id, [])
+    session_ctx.append({"command": cmd.command, "reason": cmd.reason})
+    sessions[cmd.device_id] = session_ctx
+
+    # Log successful action
+    log_action(cmd.device_id, cmd.command, cmd.reason, cmd.risk_score, "EXECUTED")
+    return {"status": "success", "message": f"Command executed: {cmd.command}", "session_context": session_ctx}
+
+@app.get("/generate_token/{device_id}")
+async def get_token(device_id: str):
+    token = generate_token(device_id)
+    # Simulate rotating device proof
+    device_proofs[device_id] = secrets.token_hex(8)
+    return {"token": token, "device_proof": device_proofs[device_id]}
+
+@app.get("/audit")
+async def get_audit():
+    return {"audit_logs": audit_logs}
+
+# --- Background stress simulation ---
+async def stress_simulator():
+    while True:
+        if tokens:
+            device_id = list(tokens.values())[0]
+            cmd = Command(
+                token=list(tokens.keys())[0],
+                device_id=device_id,
+                command="stress_test",
+                reason="background",
+                risk_score=10
+            )
+            await execute(cmd)
+        await asyncio.sleep(5)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(stress_simulator())
