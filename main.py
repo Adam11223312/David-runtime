@@ -1,122 +1,97 @@
-main.py - David AI Conversational Full System (No visuals)
-
-import threading
+from fastapi import FastAPI, Header, HTTPException, Depends
+from pydantic import BaseModel
+from typing import Optional
 import time
-import pyttsx3
-import keyboard
-import os
-import random
+import uuid
 
-try:
-    import qrcode
-    from PIL import Image
-except ImportError:
-    os.system(f"{os.sys.executable} -m pip install qrcode[pil] pillow")
-    import qrcode
-    from PIL import Image
+# --- 1. CONFIG & IDENTITY ---
+app = FastAPI(
+    title="David Governance Engine",
+    description="Strategic Risk & Identity Security Layer",
+    version="2.1.0"
+)
 
-# -----------------------
-# Voice Setup
-# -----------------------
-VOICE_RATE = 150
-engine = pyttsx3.init()
-engine.setProperty('rate', VOICE_RATE)
+# Mock Databases (Replace with Redis/PostgreSQL for production)
+TRUSTED_DEVICES = {"DEV-8821", "IPHONE-X-99", "MAC-PRO-01"}
+# Active tokens with expiry timestamps
+ACTIVE_TOKENS = {"SECURE-KEY-GOLD": time.time() + 3600} 
 
-def speak(text):
-    engine.say(text)
-    engine.runAndWait()
+# --- 2. DATA MODELS ---
+class DavidRequest(BaseModel):
+    user_id: str
+    device_id: str
+    action: str  # e.g., "PAYMENT", "SENSITIVE_ACCESS", "GESTURE_CMD"
+    location: Optional[str] = "Unknown"
 
-# -----------------------
-# Keyboard Listener
-# -----------------------
-def listen_keyboard():
-    print("Press ESC to exit David.")
-    while True:
-        if keyboard.is_pressed('esc'):
-            print("Exiting David...")
-            os._exit(0)
-        time.sleep(0.05)
+class DavidResponse(BaseModel):
+    decision: str      # ALLOW / DENY / FLAG
+    risk_score: int    # 0 to 100
+    audit_id: str      # For Point 5: Legal Audit Trail
+    logic_summary: str # Narrative for the UI
+    timestamp: float
 
-# -----------------------
-# QR Code Generator
-# -----------------------
-QR_CODE_DIR = "qrcodes"
-if not os.path.exists(QR_CODE_DIR):
-    os.makedirs(QR_CODE_DIR)
+# --- 3. THE RISK BRAIN (Points 1, 3, & 4) ---
+def evaluate_risk(req: DavidRequest, token: str):
+    score = 0
+    flags = []
 
-def generate_qr(data="David AI Operational"):
-    try:
-        filename = os.path.join(QR_CODE_DIR, f"qr_{int(time.time())}.png")
-        qr = qrcode.QRCode(
-            version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=10,
-            border=4,
-        )
-        qr.add_data(data)
-        qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white")
-        img.save(filename)
-        print(f"Generated QR code: {filename}")
-    except Exception as e:
-        print("QR generation error:", e)
+    # A. Device Intelligence (Point 3)
+    if req.device_id not in TRUSTED_DEVICES:
+        score += 45
+        flags.append("UNRECOGNIZED_HARDWARE")
 
-def qr_loop():
-    while True:
-        generate_qr()
-        time.sleep(10)
+    # B. Token Security (Point 2)
+    if token not in ACTIVE_TOKENS or time.time() > ACTIVE_TOKENS[token]:
+        score += 100  # Instant critical risk
+        flags.append("TOKEN_EXPIRED_OR_INVALID")
 
-# -----------------------
-# Conversational Personality
-# -----------------------
-def david_response(user_input):
-    user_input_lower = user_input.lower()
-    responses = []
+    # C. Strategic Logic (Points 4 & 12)
+    # High-value actions from unknown devices trigger "FLAG" (Yellow UI)
+    if req.action == "PAYMENT" and req.device_id not in TRUSTED_DEVICES:
+        score += 25
+        flags.append("SUSPICIOUS_PAYMENT_ORIGIN")
 
-    # Humor / wit
-    if "joke" in user_input_lower:
-        jokes = [
-            "Why did the AI cross the road? To optimize traffic, of course!",
-            "I would tell you a joke about algorithms, but it's still running..."
-        ]
-        responses.append(random.choice(jokes))
+    # Final Decision Mapping
+    score = min(score, 100)
+    if score >= 85:
+        decision = "DENY"
+    elif score >= 40:
+        decision = "FLAG"  # Triggers David's prompt for Gesture/MFA
+    else:
+        decision = "ALLOW"
+
+    return decision, score, " | ".join(flags) if flags else "SECURITY_NOMINAL"
+
+# --- 4. THE API ENDPOINT (Point 11) ---
+@app.post("/v1/governance/evaluate", response_model=DavidResponse)
+async def check_risk(req: DavidRequest, x_david_token: str = Header(None)):
+    """
+    Main entry point for David's Decision Engine.
+    Used by Insurance, Auto, and Enterprise partners.
+    """
+    decision, score, logic = evaluate_risk(req, x_david_token)
     
-    # Greetings
-    if any(word in user_input_lower for word in ["hi", "hello", "hey"]):
-        responses.append("Hey there! David at your service.")
+    # Audit Trail (Point 5)
+    audit_id = str(uuid.uuid4())
     
-    # Accessibility / special phrases
-    if "blinding noise" in user_input_lower:
-        responses.append("I hear you! Activating hand-gesture alert mode.")
-    
-    # Default fallback
-    if not responses:
-        # Add some human-like responses
-        fallback = [
-            f"Interesting, tell me more about '{user_input}'",
-            f"Hmm, I think I understand, can you expand on that?",
-            f"Ah, got it! You said: '{user_input}'"
-        ]
-        responses.append(random.choice(fallback))
-    
-    # Pick one response
-    return random.choice(responses)
+    # Personality context (Point 6)
+    status_msg = f"Decision: {decision}. Risk evaluated at {score}%."
 
-# -----------------------
-# Main Loop
-# -----------------------
-def main():
-    threading.Thread(target=listen_keyboard, daemon=True).start()
-    threading.Thread(target=qr_loop, daemon=True).start()
+    return DavidResponse(
+        decision=decision,
+        risk_score=score,
+        audit_id=audit_id,
+        logic_summary=logic,
+        timestamp=time.time()
+    )
 
-    speak("Hello! I am David, your intelligent assistant. Let's chat.")
+# --- 5. SYSTEM HEALTH ---
+@app.get("/status")
+async def get_status():
+    return {
+        "entity": "David",
+        "state": "CALM_CONFIDENT",
+        "governance_active": True
+    }
 
-    while True:
-        user_input = input("You: ")
-        if user_input.strip() != "":
-            response = david_response(user_input)
-            print("David:", response)
-            speak(response)
-
-if __name__ == "__main__":
-    main()o
+# TO RUN: uvicorn main:app --reload
