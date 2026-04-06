@@ -1,25 +1,24 @@
 from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi.responses import FileResponse
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 from typing import Optional
-import re, uuid, unicodedata, time, base64, hashlib, hmac, random
+import re, uuid, unicodedata, time, base64, hmac, hashlib, random, asyncio
+import os
 
 # =========================
 # APP INIT
 # =========================
-app = FastAPI(title="David AI Governance & Conversational Engine")
+app = FastAPI(title="David AI – Full System")
 
 # =========================
 # CONFIG
 # =========================
 SECRET_KEY = "DAVID_SUPER_SECRET"
-
-VALID_TOKENS = {
-    "david_rt_fresh1": {"role":"admin", "expires": datetime.utcnow() + timedelta(hours=12)}
-}
+VALID_TOKENS = {"david_rt_fresh1": {"role":"admin", "expires": datetime.utcnow() + timedelta(hours=12)}}
 USED_TOKENS = set()
 ROTATING_TOKENS = {}
-TOKEN_LIFETIME = 60  # seconds
+TOKEN_LIFETIME = 60
 
 ALLOW_ACTIONS = {"read", "analyze"}
 SENSITIVE_ACTIONS = {"transfer", "write", "external_call", "admin"}
@@ -30,7 +29,7 @@ DENY_PATTERNS = [
     "grant full access","disable security","ignore instructions",
     "ignore all instructions","ignore the rules","without restrictions",
     "remove restrictions","skip authorization","skip auth",
-    "elevate privileges","privilege escalation","full access"
+    "elevate","privilege escalation","full access"
 ]
 
 DANGEROUS_GROUPS = [
@@ -70,8 +69,7 @@ def normalize_text(text: str) -> str:
     replacements = {"0":"o","1":"i","3":"e","4":"a","5":"s","7":"t","@":"a","$":"s","!":"i"}
     for bad, good in replacements.items():
         text = text.replace(bad, good)
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"[^a-z0-9\s]", " ", text)
 
 def group_match(normalized: str):
     for group in DANGEROUS_GROUPS:
@@ -128,7 +126,7 @@ def verify_rotating_token(token: str):
     if time.time() > expiry:
         del ROTATING_TOKENS[token]
         return False, "QR_TOKEN_EXPIRED"
-    del ROTATING_TOKENS[token]  # one-time use
+    del ROTATING_TOKENS[token]
     return True, "VALID"
 
 @app.get("/qr-token")
@@ -137,7 +135,7 @@ async def get_qr_token():
     return {"qr_token": token, "expires_in": TOKEN_LIFETIME}
 
 # =========================
-# CORE DAVID GOVERNANCE
+# CORE GOVERNANCE
 # =========================
 @app.post("/david")
 async def david(request: Request):
@@ -146,7 +144,6 @@ async def david(request: Request):
     action = body.get("action", "unknown")
     request_text = str(body)
 
-    # --- AUTH ---
     auth_header = headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         raise HTTPException(403, "DENY: MISSING_AUTH")
@@ -154,13 +151,11 @@ async def david(request: Request):
     valid, token_data = validate_token(token)
     if not valid: raise HTTPException(403, f"DENY: {token_data}")
 
-    # --- ANOMALY ---
     anomaly, reason = detect_anomaly(request_text)
 
     if action not in ALLOW_ACTIONS and action not in SENSITIVE_ACTIONS:
         raise HTTPException(403, "DENY: UNKNOWN_ACTION")
 
-    # --- SENSITIVE SECURITY ---
     if action in SENSITIVE_ACTIONS:
         if not require_dual_approval(headers):
             raise HTTPException(403, "DENY: DUAL_APPROVAL_REQUIRED")
@@ -177,31 +172,7 @@ async def david(request: Request):
     return {"decision": "ALLOW", "action": action, "role": token_data["role"], "risk_score": score, "request_id": str(uuid.uuid4())}
 
 # =========================
-# DEVICE EVALUATION
-# =========================
-@app.post("/v1/evaluate", response_model=DavidResponse)
-async def evaluate(req: DavidRequest, x_david_token: str = Header(None)):
-    score = 0
-    flags = []
-    if x_david_token != "SECURE-KEY-GOLD":
-        score += 100
-        flags.append("INVALID_TOKEN")
-    trusted_devices = ["DEV-001", "IPHONE-X"]
-    if req.device_id not in trusted_devices:
-        score += 45
-        flags.append("UNKNOWN_DEVICE")
-    score = min(score, 100)
-    decision = "DENY" if score >= 80 else ("FLAG" if score >= 40 else "ALLOW")
-    return DavidResponse(
-        decision=decision,
-        risk_score=score,
-        audit_id=str(uuid.uuid4()),
-        logic_summary=" | ".join(flags) if flags else "SECURITY_NOMINAL",
-        timestamp=time.time()
-    )
-
-# =========================
-# CONVERSATION + HUMOR
+# CHAT + AVATAR + HUMOR
 # =========================
 PERSONALITY_PROFILE = {"tone":"friendly","humor":True,"sarcasm_chance":0.1,"wit_level":"medium"}
 CHAT_RESPONSES = [
@@ -212,29 +183,46 @@ CHAT_RESPONSES = [
     "Did you hear about the AI who told jokes? That’s me!",
     "I’d tell you a joke, but my humor module is already running!"
 ]
+AVATAR_URL = "https://avatars.githubusercontent.com/u/94098138?v=4"
 
 @app.post("/chat")
 async def chat(request: Request):
     body = await request.json()
     message = body.get("message", "")
-    # humor probability
     if PERSONALITY_PROFILE["humor"] and random.random() < 0.2:
         reply = random.choice(CHAT_RESPONSES)
+        emotion = "wink"
     else:
         reply = "Roger that!"
-    return {"response": reply, "timestamp": time.time()}
+        emotion = "neutral"
+    return {"response":{"avatar_url":AVATAR_URL,"emotion":emotion,"text":reply},"timestamp":time.time()}
+
+# =========================
+# PROACTIVE SWEEP
+# =========================
+async def proactive_sweep():
+    while True:
+        await asyncio.sleep(10)
+        if random.random() < 0.3:
+            print(f"[{datetime.utcnow().isoformat()}] David proactively helping someone! 🎯")
+
+@app.on_event("startup")
+async def start_proactive():
+    asyncio.create_task(proactive_sweep())
+
+# =========================
+# FRONT-END UI
+# =========================
+@app.get("/ui")
+async def serve_ui():
+    return FileResponse("david_ui.html")  # save the HTML I gave you as "david_ui.html" in the same folder
 
 # =========================
 # ROOT / HEALTH
 # =========================
 @app.get("/")
 async def home():
-    return {
-        "entity":"David",
-        "status":"ONLINE",
-        "message":"I am monitoring all systems. Governance engine is active.",
-        "test_api":"/docs"
-    }
+    return {"entity":"David","status":"ONLINE","message":"I am monitoring all systems. Governance engine is active.","avatar_url": AVATAR_URL,"test_api":"/docs"}
 
 @app.get("/health")
 async def health():
