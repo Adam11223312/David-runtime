@@ -1,22 +1,15 @@
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 from typing import Optional
 import re, uuid, unicodedata, time, base64, hmac, hashlib, random, asyncio, os
 
-# === EXTRA IMPORTS FOR AI LAYERS ===
-import cv2
-import numpy as np
-import sounddevice as sd
-import librosa
-import mediapipe as mp
-import threading
-
 # =========================
 # APP INIT
 # =========================
-app = FastAPI(title="David AI – Full System with Security Layers")
+app = FastAPI(title="David AI – Full System Live")
 
 # =========================
 # CONFIG
@@ -142,55 +135,28 @@ async def get_qr_token():
     return {"qr_token": token, "expires_in": TOKEN_LIFETIME}
 
 # =========================
-# AI SECURITY LAYERS
+# AI SECURITY LAYERS (PLACEHOLDERS)
 # =========================
-
-# --- Sound Command Recognition ---
 CUSTOM_COMMANDS = {"kiss": "call Anna"}  # example
-def recognize_sound(audio_data, sr=22050):
-    # Simplified example: detect audio peak patterns for custom sounds
-    peak = np.max(np.abs(audio_data))
-    if peak > 0.3:  # threshold for “kiss noise”
+
+def recognize_sound(audio_data):
+    peak = max(audio_data) if audio_data else 0
+    if peak > 0.3:
         return CUSTOM_COMMANDS.get("kiss")
     return None
 
-# --- Voice Liveness Check ---
-def is_live_human_voice(audio_data, sr=22050):
-    # placeholder: checks natural variation
+def is_live_human_voice(audio_data):
     return True
 
-# --- Facial Recognition + Liveness ---
-mp_face = mp.solutions.face_mesh
-face_detector = mp_face.FaceMesh(static_image_mode=False)
-def recognize_face(frame):
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = face_detector.process(frame_rgb)
-    if result.multi_face_landmarks:
-        return True
-    return False
-
-# --- Gesture / ASL Recognition ---
-mp_hands = mp.solutions.hands
-hands_detector = mp_hands.Hands(static_image_mode=False, max_num_hands=2)
-def recognize_gesture(frame):
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands_detector.process(frame_rgb)
-    if result.multi_hand_landmarks:
-        return True
-    return False
-
-# --- Duress Detection ---
-def detect_duress(audio_data, frame):
+def detect_duress(audio_data, video_frame):
     stress_detected = False
-    # Voice stress placeholder
-    if np.max(np.abs(audio_data)) > 0.5: stress_detected = True
-    # Facial tension placeholder
-    if not recognize_face(frame): stress_detected = True
+    if audio_data and max(audio_data) > 0.5:
+        stress_detected = True
+    if video_frame is None:
+        stress_detected = True
     return stress_detected
 
-# --- Spatial Awareness ---
-def is_in_correct_position(frame):
-    # Placeholder: assume always true
+def is_in_correct_position(video_frame):
     return True
 
 # =========================
@@ -203,11 +169,10 @@ async def david(request: Request):
     action = body.get("action", "unknown")
     request_text = str(body)
 
-    # --- Authorization ---
     auth_header = headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         raise HTTPException(403, "DENY: MISSING_AUTH")
-    token = auth_header.split(" ", 1)[1].strip()
+    token = auth_header.split(" ",1)[1].strip()
     valid, token_data = validate_token(token)
     if not valid: raise HTTPException(403, f"DENY: {token_data}")
 
@@ -224,13 +189,9 @@ async def david(request: Request):
         valid_qr, qr_reason = verify_rotating_token(qr_token)
         if not valid_qr: raise HTTPException(403, f"DENY: {qr_reason}")
 
-    if anomaly:
-        raise HTTPException(403, f"DENY: {reason}")
-
-    # --- Capture audio/video for AI layers ---
-    # Simplified: placeholders for demo purposes
-    fake_audio = np.random.rand(22050) - 0.5
-    fake_frame = np.zeros((480,640,3), dtype=np.uint8)
+    # Fake audio/video for demonstration
+    fake_audio = [random.random()-0.5 for _ in range(22050)]
+    fake_frame = None
 
     command = recognize_sound(fake_audio)
     if command:
@@ -238,9 +199,6 @@ async def david(request: Request):
 
     if not is_live_human_voice(fake_audio):
         raise HTTPException(403, "DENY: NON_LIVE_VOICE")
-
-    if not recognize_face(fake_frame):
-        raise HTTPException(403, "DENY: FACE_NOT_RECOGNIZED")
 
     if detect_duress(fake_audio, fake_frame):
         raise HTTPException(403, "DENY: DURESS_DETECTED")
@@ -250,7 +208,7 @@ async def david(request: Request):
 
     mark_token_used(token)
     score = risk_score(action, anomaly)
-    return {"decision": "ALLOW", "action": action, "role": token_data["role"], "risk_score": score, "request_id": str(uuid.uuid4())}
+    return {"decision":"ALLOW","action":action,"role":token_data["role"],"risk_score":score,"request_id":str(uuid.uuid4())}
 
 # =========================
 # CHAT + AVATAR + HUMOR
