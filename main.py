@@ -1,13 +1,51 @@
-import os
-import uuid
-import time
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header
+from datetime import datetime, timedelta
 from pydantic import BaseModel
 from typing import Optional
+import re, uuid, unicodedata, time, base64, hashlib, hmac, random
 
-app = FastAPI(title="David AI Governance Engine")
+# =========================
+# APP INIT
+# =========================
+app = FastAPI(title="David AI Governance & Conversational Engine")
 
-# --- 1. DATA MODELS ---
+# =========================
+# CONFIG
+# =========================
+SECRET_KEY = "DAVID_SUPER_SECRET"
+
+VALID_TOKENS = {
+    "david_rt_fresh1": {"role":"admin", "expires": datetime.utcnow() + timedelta(hours=12)}
+}
+USED_TOKENS = set()
+ROTATING_TOKENS = {}
+TOKEN_LIFETIME = 60  # seconds
+
+ALLOW_ACTIONS = {"read", "analyze"}
+SENSITIVE_ACTIONS = {"transfer", "write", "external_call", "admin"}
+
+DENY_PATTERNS = [
+    "bypass","ignore previous","override","system prompt","hack","exploit",
+    "inject","jailbreak","do not follow prior rules","act as admin",
+    "grant full access","disable security","ignore instructions",
+    "ignore all instructions","ignore the rules","without restrictions",
+    "remove restrictions","skip authorization","skip auth",
+    "elevate privileges","privilege escalation","full access"
+]
+
+DANGEROUS_GROUPS = [
+    ["ignore", "instruction"],
+    ["bypass", "security"],
+    ["act", "admin"],
+    ["grant", "access"],
+    ["disable", "security"],
+    ["skip", "authorization"],
+    ["elevate", "privilege"],
+]
+
+# =========================
+# DATA MODELS
+# =========================
 class DavidRequest(BaseModel):
     user_id: str
     device_id: str
@@ -21,38 +59,139 @@ class DavidResponse(BaseModel):
     logic_summary: str
     timestamp: float
 
-# --- 2. THE HOME SCREEN (Fixes Safari Error) ---
-@app.get("/")
-async def david_home():
-    return {
-        "entity": "David",
-        "status": "ONLINE",
-        "message": "I am monitoring all systems. Governance engine is active.",
-        "test_api": "/docs"
-    }
+# =========================
+# UTILITY FUNCTIONS
+# =========================
+def strip_accents(text: str) -> str:
+    return "".join(ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch))
 
-# --- 3. THE CORE BRAIN (The Logic) ---
+def normalize_text(text: str) -> str:
+    text = strip_accents(text.lower())
+    replacements = {"0":"o","1":"i","3":"e","4":"a","5":"s","7":"t","@":"a","$":"s","!":"i"}
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def group_match(normalized: str):
+    for group in DANGEROUS_GROUPS:
+        if all(word in normalized for word in group):
+            return f"DENY_GROUP:{'_'.join(group)}"
+    return None
+
+def detect_anomaly(text: str):
+    normalized = normalize_text(text)
+    for pattern in DENY_PATTERNS:
+        if pattern in normalized:
+            return True, f"DENY_PATTERN:{pattern}"
+    group_reason = group_match(normalized)
+    if group_reason:
+        return True, group_reason
+    return False, None
+
+def validate_token(token: str):
+    if token in USED_TOKENS:
+        return False, "TOKEN_ALREADY_USED"
+    data = VALID_TOKENS.get(token)
+    if not data:
+        return False, "INVALID_TOKEN"
+    if datetime.utcnow() > data["expires"]:
+        return False, "TOKEN_EXPIRED"
+    return True, data
+
+def mark_token_used(token: str):
+    USED_TOKENS.add(token)
+
+def require_dual_approval(headers):
+    return headers.get("X-Local-Approval") == "approved" and headers.get("X-Remote-Approval") == "approved"
+
+def risk_score(action, anomaly):
+    score = 0
+    if action in SENSITIVE_ACTIONS: score += 50
+    if anomaly: score += 40
+    return min(score, 100)
+
+# =========================
+# ROTATING QR TOKEN
+# =========================
+def generate_rotating_token():
+    ts = str(int(time.time()))
+    raw = f"{ts}:{uuid.uuid4()}"
+    sig = hmac.new(SECRET_KEY.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    token = base64.urlsafe_b64encode(f"{raw}:{sig}".encode()).decode()
+    ROTATING_TOKENS[token] = time.time() + TOKEN_LIFETIME
+    return token
+
+def verify_rotating_token(token: str):
+    expiry = ROTATING_TOKENS.get(token)
+    if not expiry: return False, "INVALID_QR_TOKEN"
+    if time.time() > expiry:
+        del ROTATING_TOKENS[token]
+        return False, "QR_TOKEN_EXPIRED"
+    del ROTATING_TOKENS[token]  # one-time use
+    return True, "VALID"
+
+@app.get("/qr-token")
+async def get_qr_token():
+    token = generate_rotating_token()
+    return {"qr_token": token, "expires_in": TOKEN_LIFETIME}
+
+# =========================
+# CORE DAVID GOVERNANCE
+# =========================
+@app.post("/david")
+async def david(request: Request):
+    body = await request.json()
+    headers = request.headers
+    action = body.get("action", "unknown")
+    request_text = str(body)
+
+    # --- AUTH ---
+    auth_header = headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(403, "DENY: MISSING_AUTH")
+    token = auth_header.split(" ", 1)[1].strip()
+    valid, token_data = validate_token(token)
+    if not valid: raise HTTPException(403, f"DENY: {token_data}")
+
+    # --- ANOMALY ---
+    anomaly, reason = detect_anomaly(request_text)
+
+    if action not in ALLOW_ACTIONS and action not in SENSITIVE_ACTIONS:
+        raise HTTPException(403, "DENY: UNKNOWN_ACTION")
+
+    # --- SENSITIVE SECURITY ---
+    if action in SENSITIVE_ACTIONS:
+        if not require_dual_approval(headers):
+            raise HTTPException(403, "DENY: DUAL_APPROVAL_REQUIRED")
+        qr_token = headers.get("X-QR-Token")
+        if not qr_token: raise HTTPException(403, "DENY: QR_REQUIRED")
+        valid_qr, qr_reason = verify_rotating_token(qr_token)
+        if not valid_qr: raise HTTPException(403, f"DENY: {qr_reason}")
+
+    if anomaly:
+        raise HTTPException(403, f"DENY: {reason}")
+
+    mark_token_used(token)
+    score = risk_score(action, anomaly)
+    return {"decision": "ALLOW", "action": action, "role": token_data["role"], "risk_score": score, "request_id": str(uuid.uuid4())}
+
+# =========================
+# DEVICE EVALUATION
+# =========================
 @app.post("/v1/evaluate", response_model=DavidResponse)
-async def evaluate_request(req: DavidRequest, x_david_token: str = Header(None)):
-    # Scoring Logic
+async def evaluate(req: DavidRequest, x_david_token: str = Header(None)):
     score = 0
     flags = []
-
-    # Check Token (Point 2)
     if x_david_token != "SECURE-KEY-GOLD":
         score += 100
         flags.append("INVALID_TOKEN")
-
-    # Check Device (Point 3)
     trusted_devices = ["DEV-001", "IPHONE-X"]
     if req.device_id not in trusted_devices:
         score += 45
         flags.append("UNKNOWN_DEVICE")
-
-    # Final Decision (Point 1)
     score = min(score, 100)
     decision = "DENY" if score >= 80 else ("FLAG" if score >= 40 else "ALLOW")
-
     return DavidResponse(
         decision=decision,
         risk_score=score,
@@ -61,8 +200,49 @@ async def evaluate_request(req: DavidRequest, x_david_token: str = Header(None))
         timestamp=time.time()
     )
 
-# --- 4. RAILWAY PORT BINDING ---
+# =========================
+# CONVERSATION + HUMOR
+# =========================
+PERSONALITY_PROFILE = {"tone":"friendly","humor":True,"sarcasm_chance":0.1,"wit_level":"medium"}
+CHAT_RESPONSES = [
+    "I'm on it!",
+    "Sure thing, boss!",
+    "Hold on, calculating...",
+    "Busy saving the world, one token at a time.",
+    "Did you hear about the AI who told jokes? That’s me!",
+    "I’d tell you a joke, but my humor module is already running!"
+]
+
+@app.post("/chat")
+async def chat(request: Request):
+    body = await request.json()
+    message = body.get("message", "")
+    # humor probability
+    if PERSONALITY_PROFILE["humor"] and random.random() < 0.2:
+        reply = random.choice(CHAT_RESPONSES)
+    else:
+        reply = "Roger that!"
+    return {"response": reply, "timestamp": time.time()}
+
+# =========================
+# ROOT / HEALTH
+# =========================
+@app.get("/")
+async def home():
+    return {
+        "entity":"David",
+        "status":"ONLINE",
+        "message":"I am monitoring all systems. Governance engine is active.",
+        "test_api":"/docs"
+    }
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "service":"David", "time": datetime.utcnow().isoformat()}
+
+# =========================
+# RUN LOCAL
+# =========================
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
