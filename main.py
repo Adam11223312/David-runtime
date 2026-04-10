@@ -2,7 +2,6 @@ import secrets
 import time
 import hashlib
 import json
-import sys
 from typing import Dict, Any
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,23 +22,23 @@ class IdentityToken:
 
 class DavidCoreEngine:
     """
-    The Brain: Integrates Autonomous Action, Bank-Grade Identity, 
-    and Fleet Protection Protocols. Refactored for extreme stability.
+    The Brain: Integrated Autonomous Action Engine + Bank-Grade Identity.
+    Refactored to eliminate file-system dependencies for 100% stability.
     """
     def __init__(self):
         self._vault: Dict[str, IdentityToken] = {}
-        self.evolution_log = [] # Backup in-memory log
-        print(f"[SYSTEM] David Core V1.1 Booted. Standards: {FIPS_LEVEL}")
+        self.evolution_log = [] # In-memory audit trail
+        print(f"[SYSTEM] David Core V1.2 Booted. Standards: {FIPS_LEVEL}")
 
     def log_event(self, event_type: str, details: Dict[str, Any]):
-        """Immortalizes every move in the Brain."""
+        """Immortalizes every move in the Brain's memory."""
         entry = {
             "event": event_type, 
             "data": details, 
             "timestamp": datetime.now().isoformat()
         }
         self.evolution_log.append(entry)
-        # Direct print ensures visibility even if file writing fails
+        # Direct console output for real-time tracking
         print(f"[AUDIT][{event_type}] {json.dumps(details)}")
 
     def rotate_identity(self, identity_spec: str) -> str:
@@ -117,8 +116,9 @@ def main():
 
         # 3. Fleet Protection in Action
         if david.authorize_action(token):
+            # Telemetry stream for David's proactive response logic
             telemetry = {"proximity_risk": 0.15, "system_latency": 0.05, "driver_fatigue": 0.1}
-            david.fleet_risk_scoring("TRUCK-001", telemetry)
+            david.fleet_risk_scoring("TRUCK-BRAVO-9", telemetry)
 
         # 4. Mandatory Footprint Deletion
         david.zeroize(token)
@@ -127,7 +127,7 @@ def main():
         david.generate_white_house_euar_report()
         
     except Exception as e:
-        print(f"[CRITICAL ERROR] Core Engine halted: {e}")
+        print(f"[CRITICAL ERROR] David Engine halted: {e}")
 
 if __name__ == "__main__":
     main()
