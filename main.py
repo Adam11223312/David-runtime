@@ -1,133 +1,157 @@
-import secrets
-import time
+from fastapi import FastAPI, Request, Header, HTTPException
+from pydantic import BaseModel
 import hashlib
-import json
-from typing import Dict, Any
-from dataclasses import dataclass
-from datetime import datetime
+import time
+import uuid
 
-# --- DAVID'S CORE SPECS (FEDERAL COMPLIANCE 2026) ---
-IDENTITY_TTL = 60  # Rotating Token Life (Seconds)
-FIPS_LEVEL = "140-3 Level 3"
-PQC_STANDARDS = "ML-KEM (FIPS 203) & ML-DSA (FIPS 204)"
+app = FastAPI(title="David AI Core")
 
-@dataclass
-class IdentityToken:
-    token_id: str
-    identity_spec: str
-    created_at: float
-    expires_at: float
-    quantum_signature: str
-    status: str = "ACTIVE"
+# -----------------------------
+# In-memory stores (replace later with DB / Redis / HSM)
+# -----------------------------
+TOKENS = {}
+AUDIT_LOG = []
 
-class DavidCoreEngine:
-    """
-    The Brain: Integrated Autonomous Action Engine + Bank-Grade Identity.
-    Refactored to eliminate file-system dependencies for 100% stability.
-    """
-    def __init__(self):
-        self._vault: Dict[str, IdentityToken] = {}
-        self.evolution_log = [] # In-memory audit trail
-        print(f"[SYSTEM] David Core V1.2 Booted. Standards: {FIPS_LEVEL}")
+# -----------------------------
+# Models
+# -----------------------------
+class AuthRequest(BaseModel):
+    device_id: str
+    intent: str  # RAR (Rich Authorization Request)
+    amount: float = 0
 
-    def log_event(self, event_type: str, details: Dict[str, Any]):
-        """Immortalizes every move in the Brain's memory."""
-        entry = {
-            "event": event_type, 
-            "data": details, 
-            "timestamp": datetime.now().isoformat()
-        }
-        self.evolution_log.append(entry)
-        # Direct console output for real-time tracking
-        print(f"[AUDIT][{event_type}] {json.dumps(details)}")
+class VerifyRequest(BaseModel):
+    token: str
+    device_id: str
+    dpop_proof: str
 
-    def rotate_identity(self, identity_spec: str) -> str:
-        """The Identity Layer: Generates 60s rotating Bank-Grade tokens."""
-        token_id = secrets.token_urlsafe(32)
-        now = time.time()
-        
-        # PQC Signature Simulation for White House Proof-of-Work
-        sig_input = f"{token_id}{identity_spec}{now}"
-        quantum_sig = hashlib.sha3_512(sig_input.encode()).hexdigest()
+# -----------------------------
+# Utility Functions
+# -----------------------------
+def generate_token(device_id):
+    raw = f"{device_id}-{uuid.uuid4()}-{time.time()}"
+    token = hashlib.sha256(raw.encode()).hexdigest()
+    TOKENS[token] = {
+        "device_id": device_id,
+        "created": time.time(),
+        "used": False
+    }
+    return token
 
-        new_token = IdentityToken(
-            token_id=token_id,
-            identity_spec=identity_spec,
-            created_at=now,
-            expires_at=now + IDENTITY_TTL,
-            quantum_signature=quantum_sig
-        )
-        
-        self._vault[token_id] = new_token
-        self.log_event("IDENTITY_ROTATION", {"token_id": token_id[:8], "spec": identity_spec})
-        return token_id
+def verify_dpop(token, device_id, dpop_proof):
+    # Simplified DPoP check (bind token to device)
+    expected = hashlib.sha256((token + device_id).encode()).hexdigest()
+    return expected == dpop_proof
 
-    def authorize_action(self, token_id: str) -> bool:
-        """Zero-Trust Logic: Authorized Engine Action."""
-        token = self._vault.get(token_id)
-        if not token or time.time() > token.expires_at:
-            self.zeroize(token_id)
-            self.log_event("SECURITY_DENIAL", {"reason": "Token Expired/Invalid"})
-            return False
+def risk_engine(intent, amount):
+    risk = 0
+    reason = []
 
-        print(f"[AUTH] Verified: {token_id[:8]} (FIPS 140-3 Level 3)")
-        return True
+    if "payment" in intent.lower():
+        risk += 30
+        reason.append("financial_action")
 
-    def zeroize(self, token_id: str):
-        """Mandatory Deletion: Erasing the digital footprint."""
-        if token_id in self._vault:
-            self._vault[token_id].status = "ZEROIZED"
-            del self._vault[token_id]
-            print(f"[CLEANUP] Token {token_id[:8]} securely zeroized.")
+    if amount > 1000:
+        risk += 40
+        reason.append("high_amount")
 
-    def fleet_risk_scoring(self, vehicle_id: str, sensor_data: Dict[str, float]):
-        """The Fleet: Real-time risk scoring for Insurance/Trucking offers."""
-        risk_score = sum(sensor_data.values()) / len(sensor_data)
-        action = "MONITOR" if risk_score < 0.3 else "PREEMPTIVE_INTERVENTION"
-        
-        result = {
-            "vehicle_id": vehicle_id,
-            "risk_score": round(risk_score, 4),
-            "protocol_action": action
-        }
-        self.log_event("FLEET_RISK_ASSESSMENT", result)
-        return result
+    if "admin" in intent.lower():
+        risk += 50
+        reason.append("privileged_action")
 
-    def generate_white_house_euar_report(self):
-        """Strategic Move: Automated Compliance for EUAR emails."""
-        report = {
-            "subject": "David Autonomous Action Engine - Federal Compliance Report",
-            "compliance": FIPS_LEVEL,
-            "pqc_status": PQC_STANDARDS,
-            "proactive_protection": "ENABLED",
-            "audit_trail": "IMMORTAL/IN-MEMORY"
-        }
-        print("\n--- OFFICIAL WHITE HOUSE EUAR REPORT ---")
-        print(json.dumps(report, indent=4))
-        return report
+    return risk, reason
 
-def main():
-    try:
-        # 1. Boot David
-        david = DavidCoreEngine()
+def log_event(event):
+    AUDIT_LOG.append({
+        "event": event,
+        "time": time.time()
+    })
 
-        # 2. Establish Bank-Grade Identity
-        token = david.rotate_identity(identity_spec="GLOBAL_PROACTIVE_SPEC_V1")
+# -----------------------------
+# Core Endpoints
+# -----------------------------
 
-        # 3. Fleet Protection in Action
-        if david.authorize_action(token):
-            # Telemetry stream for David's proactive response logic
-            telemetry = {"proximity_risk": 0.15, "system_latency": 0.05, "driver_fatigue": 0.1}
-            david.fleet_risk_scoring("TRUCK-BRAVO-9", telemetry)
+@app.post("/authorize")
+def authorize(req: AuthRequest):
+    token = generate_token(req.device_id)
 
-        # 4. Mandatory Footprint Deletion
-        david.zeroize(token)
+    risk, reason = risk_engine(req.intent, req.amount)
 
-        # 5. Strategic Reporting
-        david.generate_white_house_euar_report()
-        
-    except Exception as e:
-        print(f"[CRITICAL ERROR] David Engine halted: {e}")
+    decision = "ALLOW"
+    hitl = False
 
-if __name__ == "__main__":
-    main()
+    # Human-in-the-loop trigger
+    if risk >= 70:
+        decision = "REVIEW"
+        hitl = True
+    elif risk >= 90:
+        decision = "BLOCK"
+
+    log_event({
+        "type": "authorization",
+        "intent": req.intent,
+        "risk": risk,
+        "decision": decision
+    })
+
+    return {
+        "token": token,
+        "risk_score": risk,
+        "reason_codes": reason,
+        "decision": decision,
+        "human_review_required": hitl
+    }
+
+@app.post("/verify")
+def verify(req: VerifyRequest):
+    token_data = TOKENS.get(req.token)
+
+    if not token_data:
+        raise HTTPException(status_code=403, detail="Invalid token")
+
+    if token_data["used"]:
+        raise HTTPException(status_code=403, detail="Token already used")
+
+    if token_data["device_id"] != req.device_id:
+        raise HTTPException(status_code=403, detail="Device mismatch")
+
+    # DPoP validation
+    if not verify_dpop(req.token, req.device_id, req.dpop_proof):
+        raise HTTPException(status_code=403, detail="DPoP verification failed")
+
+    token_data["used"] = True
+
+    log_event({
+        "type": "verification",
+        "token": req.token
+    })
+
+    return {"status": "verified"}
+
+@app.get("/audit")
+def audit(admin_key: str = Header(None)):
+    if admin_key != "DAVID_ADMIN":
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    return {"logs": AUDIT_LOG}
+
+# -----------------------------
+# mTLS Placeholder Enforcement
+# -----------------------------
+@app.middleware("http")
+async def mtls_simulation(request: Request, call_next):
+    client_cert = request.headers.get("x-client-cert")
+
+    # Simulated mTLS enforcement
+    if not client_cert:
+        return HTTPException(status_code=403, detail="mTLS required")
+
+    response = await call_next(request)
+    return response
+
+# -----------------------------
+# Root
+# -----------------------------
+@app.get("/")
+def root():
+    return {"message": "David AI Core is running"}
