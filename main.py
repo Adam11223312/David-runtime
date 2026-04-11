@@ -7,43 +7,27 @@ import sqlite3
 import jwt
 from collections import defaultdict
 
-app = FastAPI(title="David Core - Stable Production Build")
+app = FastAPI(title="David Core - Stable Clean Build")
 
 # =========================
 # CONFIG
 # =========================
-JWT_SECRET = "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET"
+JWT_SECRET = "CHANGE_THIS_SECRET"
 JWT_ALG = "HS256"
 
-RATE_LIMIT = 60  # per minute
-BLOCK_TIME = 60  # seconds
+RATE_LIMIT = 60
+BLOCK_TIME = 60
 
 # =========================
-# DATABASE (AUDIT CHAIN)
-# =========================
-conn = sqlite3.connect("david_audit.db", check_same_thread=False)
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS audit_log (
-    id TEXT PRIMARY KEY,
-    timestamp REAL,
-    ip TEXT,
-    decision TEXT,
-    risk REAL,
-    reasons TEXT,
-    prev_hash TEXT,
-    hash TEXT
-)
-""")
-conn.commit()
-
-# =========================
-# MEMORY STATE
+# RUNTIME STATE
 # =========================
 rate_tracker = defaultdict(list)
 blocked_ips = {}
 used_nonces = set()
+
+# DB objects (initialized safely)
+conn = None
+cursor = None
 last_hash = "GENESIS_DAVID"
 
 # =========================
@@ -51,6 +35,31 @@ last_hash = "GENESIS_DAVID"
 # =========================
 class Payload(BaseModel):
     payload: dict
+
+# =========================
+# STARTUP SAFE INIT (IMPORTANT FIX)
+# =========================
+@app.on_event("startup")
+def startup():
+    global conn, cursor
+
+    conn = sqlite3.connect("david_audit.db", check_same_thread=False)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id TEXT PRIMARY KEY,
+        timestamp REAL,
+        ip TEXT,
+        decision TEXT,
+        risk REAL,
+        reasons TEXT,
+        prev_hash TEXT,
+        hash TEXT
+    )
+    """)
+
+    conn.commit()
 
 # =========================
 # AUTH
@@ -66,7 +75,7 @@ def verify_token(auth_header: str):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # =========================
-# REPLAY PROTECTION
+# NONCE PROTECTION
 # =========================
 def verify_nonce(nonce: str):
     if not nonce:
@@ -78,20 +87,15 @@ def verify_nonce(nonce: str):
     used_nonces.add(nonce)
 
 # =========================
-# RATE LIMITER
+# RATE LIMIT
 # =========================
 def rate_limit(ip: str):
     now = time.time()
 
-    if ip in blocked_ips:
-        if now < blocked_ips[ip]:
-            raise HTTPException(status_code=403, detail="IP temporarily blocked")
-        else:
-            del blocked_ips[ip]
+    if ip in blocked_ips and now < blocked_ips[ip]:
+        raise HTTPException(status_code=403, detail="IP blocked")
 
     window = rate_tracker[ip]
-
-    # remove old requests
     rate_tracker[ip] = [t for t in window if now - t < 60]
 
     rate_tracker[ip].append(now)
@@ -101,25 +105,22 @@ def rate_limit(ip: str):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 # =========================
-# RISK ENGINE
+# RISK ENGINE (CLEAN + SAFE)
 # =========================
-def analyze_payload(payload: dict):
+def analyze(payload: dict):
     risk = 0.0
     reasons = []
 
     text = str(payload)
 
-    # size check
     if len(text) > 600:
-        risk += 0.25
+        risk += 0.2
         reasons.append("Large payload")
 
-    # suspicious keywords
     if "exec" in text.lower() or "eval" in text.lower():
         risk += 0.5
-        reasons.append("Suspicious keyword detected")
+        reasons.append("Suspicious keyword")
 
-    # nesting check
     def depth(d):
         if not isinstance(d, dict):
             return 0
@@ -127,13 +128,13 @@ def analyze_payload(payload: dict):
 
     if depth(payload) > 3:
         risk += 0.3
-        reasons.append("Deep nesting detected")
+        reasons.append("Deep nesting")
 
     risk = max(0.0, min(1.0, risk))
 
-    if risk >= 0.75:
+    if risk > 0.75:
         decision = "block"
-    elif risk >= 0.4:
+    elif risk > 0.4:
         decision = "flag"
     else:
         decision = "allow"
@@ -141,14 +142,14 @@ def analyze_payload(payload: dict):
     return decision, risk, reasons
 
 # =========================
-# AUDIT HASH CHAIN
+# AUDIT HASH
 # =========================
 def hash_block(prev_hash, data):
     raw = f"{prev_hash}|{data}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 def write_audit(ip, decision, risk, reasons):
-    global last_hash
+    global last_hash, cursor, conn
 
     block_id = str(uuid.uuid4())
     timestamp = time.time()
@@ -168,13 +169,14 @@ def write_audit(ip, decision, risk, reasons):
         last_hash,
         current_hash
     ))
-    conn.commit()
 
+    conn.commit()
     last_hash = current_hash
+
     return current_hash
 
 # =========================
-# RESPONSE FORMAT
+# RESPONSE
 # =========================
 def message(decision):
     if decision == "allow":
@@ -187,7 +189,7 @@ def message(decision):
 # MAIN ENDPOINT
 # =========================
 @app.post("/analyze")
-async def analyze(
+async def analyze_request(
     request: Request,
     data: Payload,
     authorization: str = Header(None),
@@ -196,15 +198,12 @@ async def analyze(
     start = time.time()
     ip = request.client.host
 
-    # SECURITY LAYER
     verify_token(authorization)
     verify_nonce(x_nonce)
     rate_limit(ip)
 
-    # CORE LOGIC
-    decision, risk, reasons = analyze_payload(data.payload)
+    decision, risk, reasons = analyze(data.payload)
 
-    # AUDIT
     audit_hash = write_audit(ip, decision, risk, reasons)
 
     return {
@@ -217,7 +216,7 @@ async def analyze(
     }
 
 # =========================
-# VERIFY AUDIT CHAIN
+# AUDIT CHECK
 # =========================
 @app.get("/audit/verify")
 def verify():
@@ -225,6 +224,6 @@ def verify():
     count = cursor.fetchone()[0]
 
     return {
-        "audit_records": count,
-        "status": "ok"
+        "status": "ok",
+        "records": count
     }
