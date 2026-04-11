@@ -6,28 +6,46 @@ import uuid
 import sqlite3
 import jwt
 from collections import defaultdict
+import os
 
-app = FastAPI(title="David Core - Stable Clean Build")
+app = FastAPI(title="David Core API - Stable Build")
 
 # =========================
 # CONFIG
 # =========================
-JWT_SECRET = "CHANGE_THIS_SECRET"
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 JWT_ALG = "HS256"
 
 RATE_LIMIT = 60
 BLOCK_TIME = 60
 
 # =========================
-# RUNTIME STATE
+# SAFE DATABASE (RAILWAY COMPATIBLE)
+# =========================
+DB_PATH = "/tmp/david_audit.db"
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS audit_log (
+    id TEXT PRIMARY KEY,
+    timestamp REAL,
+    ip TEXT,
+    decision TEXT,
+    risk REAL,
+    reasons TEXT,
+    prev_hash TEXT,
+    hash TEXT
+)
+""")
+conn.commit()
+
+# =========================
+# MEMORY
 # =========================
 rate_tracker = defaultdict(list)
 blocked_ips = {}
 used_nonces = set()
-
-# DB objects (initialized safely)
-conn = None
-cursor = None
 last_hash = "GENESIS_DAVID"
 
 # =========================
@@ -37,45 +55,21 @@ class Payload(BaseModel):
     payload: dict
 
 # =========================
-# STARTUP SAFE INIT (IMPORTANT FIX)
-# =========================
-@app.on_event("startup")
-def startup():
-    global conn, cursor
-
-    conn = sqlite3.connect("david_audit.db", check_same_thread=False)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS audit_log (
-        id TEXT PRIMARY KEY,
-        timestamp REAL,
-        ip TEXT,
-        decision TEXT,
-        risk REAL,
-        reasons TEXT,
-        prev_hash TEXT,
-        hash TEXT
-    )
-    """)
-
-    conn.commit()
-
-# =========================
 # AUTH
 # =========================
 def verify_token(auth_header: str):
     if not auth_header:
         raise HTTPException(status_code=401, detail="Missing token")
 
+    token = auth_header.replace("Bearer ", "")
+
     try:
-        token = auth_header.replace("Bearer ", "")
         jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # =========================
-# NONCE PROTECTION
+# REPLAY PROTECTION
 # =========================
 def verify_nonce(nonce: str):
     if not nonce:
@@ -105,7 +99,7 @@ def rate_limit(ip: str):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 # =========================
-# RISK ENGINE (CLEAN + SAFE)
+# RISK ENGINE
 # =========================
 def analyze(payload: dict):
     risk = 0.0
@@ -142,20 +136,19 @@ def analyze(payload: dict):
     return decision, risk, reasons
 
 # =========================
-# AUDIT HASH
+# AUDIT CHAIN
 # =========================
 def hash_block(prev_hash, data):
-    raw = f"{prev_hash}|{data}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+    return hashlib.sha256(f"{prev_hash}|{data}".encode()).hexdigest()
 
 def write_audit(ip, decision, risk, reasons):
-    global last_hash, cursor, conn
+    global last_hash
 
     block_id = str(uuid.uuid4())
     timestamp = time.time()
 
-    data_str = f"{ip}|{decision}|{risk}|{reasons}"
-    current_hash = hash_block(last_hash, data_str)
+    data = f"{ip}|{decision}|{risk}|{reasons}"
+    current_hash = hash_block(last_hash, data)
 
     cursor.execute("""
         INSERT INTO audit_log VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -216,14 +209,16 @@ async def analyze_request(
     }
 
 # =========================
-# AUDIT CHECK
+# HEALTH CHECK
 # =========================
+@app.get("/")
+def root():
+    return {"status": "David Core online"}
+
 @app.get("/audit/verify")
 def verify():
     cursor.execute("SELECT COUNT(*) FROM audit_log")
-    count = cursor.fetchone()[0]
-
     return {
         "status": "ok",
-        "records": count
+        "records": cursor.fetchone()[0]
     }
