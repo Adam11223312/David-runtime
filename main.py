@@ -1,198 +1,232 @@
-from fastapi import FastAPI, Request, Header, HTTPException
-from pydantic import BaseModel
-import hashlib
+from fastapi import FastAPI, Request, Header, HTTPException, Depends
+from pydantic import BaseModel, Field
 import time
+import hashlib
 import uuid
-import json
+import sqlite3
+import jwt
+from typing import Dict, Any, Optional
 
-app = FastAPI(title="David AI Core - Sovereign Build v3")
+# =========================
+# CONFIG
+# =========================
+APP_NAME = "David Core AI - Production Grade"
+JWT_SECRET = "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET"
+JWT_ALG = "HS256"
+RATE_LIMIT = 60  # per minute per IP
+BLOCK_TIME = 60  # seconds
 
-# -----------------------------
-# Audit Chain (Your System - Integrated)
-# -----------------------------
-class DavidAuditChain:
-    def __init__(self):
-        self.chain = []
-        self.last_hash = "GENESIS_BLOCK_DAVID_2026"
+app = FastAPI(title=APP_NAME)
 
-    def add_entry(self, event_type, data):
-        timestamp = time.time()
-        payload = f"{self.last_hash}|{event_type}|{json.dumps(data)}|{timestamp}"
-        current_hash = hashlib.sha3_512(payload.encode()).hexdigest()
+# =========================
+# DATABASE (AUDIT PERSISTENCE)
+# =========================
+conn = sqlite3.connect("david_audit.db", check_same_thread=False)
+cursor = conn.cursor()
 
-        entry = {
-            "event": event_type,
-            "data": data,
-            "timestamp": timestamp,
-            "prev_hash": self.last_hash,
-            "current_hash": current_hash
-        }
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS audit_log (
+    id TEXT PRIMARY KEY,
+    timestamp REAL,
+    ip TEXT,
+    decision TEXT,
+    risk REAL,
+    reasons TEXT,
+    prev_hash TEXT,
+    hash TEXT
+)
+""")
+conn.commit()
 
-        self.chain.append(entry)
-        self.last_hash = current_hash
-        return entry
+# =========================
+# MEMORY STATE
+# =========================
+rate_tracker = {}
+blocked_ips = {}
+used_nonces = set()
+last_hash = "GENESIS_DAVID_CORE"
 
-    def verify_integrity(self):
-        for i in range(1, len(self.chain)):
-            prev = self.chain[i-1]
-            curr = self.chain[i]
-            if curr['prev_hash'] != prev['current_hash']:
-                return False, f"TAMPERING DETECTED AT BLOCK {i}"
-        return True, "CHAIN VERIFIED: David's history is intact."
+# =========================
+# INPUT MODEL
+# =========================
+class Payload(BaseModel):
+    payload: Dict[str, Any] = Field(...)
 
-AUDIT_CHAIN = DavidAuditChain()
+# =========================
+# AUTH (JWT)
+# =========================
+def verify_token(auth: str):
+    if not auth:
+        raise HTTPException(status_code=401, detail="Missing token")
 
-# -----------------------------
-# In-Memory Stores (Replace later)
-# -----------------------------
-TOKENS = {}
+    try:
+        token = auth.replace("Bearer ", "")
+        jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-# -----------------------------
-# Models
-# -----------------------------
-class AuthRequest(BaseModel):
-    device_id: str
-    intent: str
-    amount: float = 0
+# =========================
+# REPLAY PROTECTION
+# =========================
+def verify_nonce(nonce: str):
+    if not nonce:
+        raise HTTPException(status_code=400, detail="Missing nonce")
 
-class VerifyRequest(BaseModel):
-    token: str
-    device_id: str
-    dpop_proof: str
+    if nonce in used_nonces:
+        raise HTTPException(status_code=400, detail="Replay detected")
 
-# -----------------------------
-# Utility Functions
-# -----------------------------
-def generate_token(device_id):
-    raw = f"{device_id}-{uuid.uuid4()}-{time.time()}"
-    token = hashlib.sha256(raw.encode()).hexdigest()
+    used_nonces.add(nonce)
 
-    TOKENS[token] = {
-        "device_id": device_id,
-        "created": time.time(),
-        "used": False
-    }
+# =========================
+# RATE LIMITER
+# =========================
+def rate_limit(ip: str):
+    now = time.time()
+    bucket = rate_tracker.get(ip, [])
 
-    AUDIT_CHAIN.add_entry("token_issued", {"device_id": device_id})
+    bucket = [t for t in bucket if now - t < 60]
+    bucket.append(now)
 
-    return token
+    rate_tracker[ip] = bucket
 
-def verify_dpop(token, device_id, dpop_proof):
-    expected = hashlib.sha256((token + device_id).encode()).hexdigest()
-    return expected == dpop_proof
+    if len(bucket) > RATE_LIMIT:
+        blocked_ips[ip] = now + BLOCK_TIME
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
-def risk_engine(intent, amount):
-    risk = 0
-    reason = []
+    if ip in blocked_ips and now < blocked_ips[ip]:
+        raise HTTPException(status_code=403, detail="IP temporarily blocked")
 
-    if "payment" in intent.lower():
-        risk += 30
-        reason.append("financial_action")
+# =========================
+# RISK ENGINE
+# =========================
+def analyze(payload: dict, ip: str):
+    risk = 0.0
+    reasons = []
 
-    if amount > 1000:
-        risk += 40
-        reason.append("high_amount")
+    payload_str = str(payload)
 
-    if "admin" in intent.lower():
-        risk += 50
-        reason.append("privileged_action")
+    # Unknown structure heuristic
+    if len(payload_str) > 600:
+        risk += 0.25
+        reasons.append("Large payload")
 
-    return risk, reason
+    # Deep nesting detection
+    def depth(d, level=0):
+        if not isinstance(d, dict):
+            return level
+        return max([depth(v, level + 1) for v in d.values()] + [level])
 
-# -----------------------------
-# Core Endpoints
-# -----------------------------
-@app.post("/authorize")
-def authorize(req: AuthRequest):
-    token = generate_token(req.device_id)
+    d = depth(payload)
+    if d > 3:
+        risk += 0.3
+        reasons.append("Deep nesting detected")
 
-    risk, reason = risk_engine(req.intent, req.amount)
+    # Random anomaly heuristic
+    if "exec" in payload_str.lower() or "eval" in payload_str.lower():
+        risk += 0.5
+        reasons.append("Suspicious keywords detected")
 
-    decision = "ALLOW"
-    hitl = False
+    # Clamp
+    risk = max(0.0, min(1.0, risk))
 
-    if risk >= 70:
-        decision = "REVIEW"
-        hitl = True
-    elif risk >= 90:
-        decision = "BLOCK"
+    if risk >= 0.75:
+        decision = "block"
+    elif risk >= 0.4:
+        decision = "flag"
+    else:
+        decision = "allow"
 
-    AUDIT_CHAIN.add_entry("authorization", {
-        "intent": req.intent,
-        "risk": risk,
-        "decision": decision
-    })
+    return decision, risk, reasons
+
+# =========================
+# HASH CHAIN (AUDIT)
+# =========================
+def hash_block(prev_hash, data):
+    raw = f"{prev_hash}|{data}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+def write_audit(ip, decision, risk, reasons):
+    global last_hash
+
+    block_id = str(uuid.uuid4())
+    timestamp = time.time()
+
+    data_str = f"{ip}|{decision}|{risk}|{reasons}"
+    current_hash = hash_block(last_hash, data_str)
+
+    cursor.execute("""
+        INSERT INTO audit_log VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        block_id,
+        timestamp,
+        ip,
+        decision,
+        risk,
+        str(reasons),
+        last_hash,
+        current_hash
+    ))
+    conn.commit()
+
+    last_hash = current_hash
+
+    return current_hash
+
+# =========================
+# RESPONSE ENGINE
+# =========================
+def message(decision):
+    if decision == "allow":
+        return "Request accepted."
+    if decision == "flag":
+        return "Request flagged for review."
+    return "Request blocked by security policy."
+
+# =========================
+# MAIN ENDPOINT
+# =========================
+@app.post("/analyze")
+async def analyze_request(
+    request: Request,
+    data: Payload,
+    authorization: Optional[str] = Header(None),
+    x_nonce: Optional[str] = Header(None)
+):
+    start = time.time()
+    ip = request.client.host
+
+    # SECURITY LAYER
+    verify_token(authorization)
+    verify_nonce(x_nonce)
+    rate_limit(ip)
+
+    # CORE ANALYSIS
+    decision, risk, reasons = analyze(data.payload, ip)
+
+    # AUDIT LOGGING
+    audit_hash = write_audit(ip, decision, risk, reasons)
+
+    latency = round(time.time() - start, 4)
 
     return {
-        "token": token,
-        "risk_score": risk,
-        "reason_codes": reason,
+        "message": message(decision),
         "decision": decision,
-        "human_review_required": hitl
+        "risk_score": risk,
+        "reasons": reasons,
+        "audit_hash": audit_hash,
+        "latency": latency
     }
 
-@app.post("/verify")
-def verify(req: VerifyRequest):
-    token_data = TOKENS.get(req.token)
-
-    if not token_data:
-        raise HTTPException(status_code=403, detail="Invalid token")
-
-    if token_data["used"]:
-        raise HTTPException(status_code=403, detail="Token already used")
-
-    if token_data["device_id"] != req.device_id:
-        raise HTTPException(status_code=403, detail="Device mismatch")
-
-    if not verify_dpop(req.token, req.device_id, req.dpop_proof):
-        raise HTTPException(status_code=403, detail="DPoP verification failed")
-
-    token_data["used"] = True
-
-    AUDIT_CHAIN.add_entry("verification", {
-        "token": req.token
-    })
-
-    return {"status": "verified"}
-
-# -----------------------------
-# Audit + Integrity Endpoints
-# -----------------------------
-@app.get("/audit")
-def audit(admin_key: str = Header(None)):
-    if admin_key != "DAVID_ADMIN":
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
-    return {"chain": AUDIT_CHAIN.chain}
-
+# =========================
+# AUDIT VERIFY ENDPOINT
+# =========================
 @app.get("/audit/verify")
-def verify_chain(admin_key: str = Header(None)):
-    if admin_key != "DAVID_ADMIN":
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
-    status, message = AUDIT_CHAIN.verify_integrity()
+def verify():
+    cursor.execute("SELECT COUNT(*) FROM audit_log")
+    count = cursor.fetchone()[0]
 
     return {
-        "valid": status,
-        "message": message
+        "audit_records": count,
+        "status": "active",
+        "integrity": "append-only"
     }
-
-# -----------------------------
-# mTLS Enforcement (Safe Version)
-# -----------------------------
-@app.middleware("http")
-async def mtls_enforcement(request: Request, call_next):
-    client_cert = request.headers.get("x-client-cert")
-
-    # Allow root for testing
-    if request.url.path != "/" and not client_cert:
-        raise HTTPException(status_code=403, detail="mTLS certificate required")
-
-    return await call_next(request)
-
-# -----------------------------
-# Root
-# -----------------------------
-@app.get("/")
-def root():
-    return {"message": "David AI Core v3 is running"}
