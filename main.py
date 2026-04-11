@@ -6,24 +6,30 @@ import uuid
 import sqlite3
 import jwt
 from collections import defaultdict
-import os
 
-app = FastAPI(title="David Core API - Stable Build")
+app = FastAPI(title="David Core - Stable Production Build")
 
 # =========================
 # CONFIG
 # =========================
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
+JWT_SECRET = "CHANGE_THIS_SECRET"
 JWT_ALG = "HS256"
 
 RATE_LIMIT = 60
 BLOCK_TIME = 60
 
 # =========================
-# SAFE DATABASE (RAILWAY COMPATIBLE)
+# STATE
 # =========================
-DB_PATH = "/tmp/david_audit.db"
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+rate_tracker = defaultdict(list)
+blocked_ips = {}
+used_nonces = set()
+last_hash = "GENESIS_DAVID"
+
+# =========================
+# DB (SIMPLE)
+# =========================
+conn = sqlite3.connect("david_audit.db", check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -41,15 +47,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 conn.commit()
 
 # =========================
-# MEMORY
-# =========================
-rate_tracker = defaultdict(list)
-blocked_ips = {}
-used_nonces = set()
-last_hash = "GENESIS_DAVID"
-
-# =========================
-# INPUT MODEL
+# INPUT
 # =========================
 class Payload(BaseModel):
     payload: dict
@@ -61,15 +59,14 @@ def verify_token(auth_header: str):
     if not auth_header:
         raise HTTPException(status_code=401, detail="Missing token")
 
-    token = auth_header.replace("Bearer ", "")
-
     try:
+        token = auth_header.replace("Bearer ", "")
         jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # =========================
-# REPLAY PROTECTION
+# NONCE
 # =========================
 def verify_nonce(nonce: str):
     if not nonce:
@@ -136,7 +133,7 @@ def analyze(payload: dict):
     return decision, risk, reasons
 
 # =========================
-# AUDIT CHAIN
+# AUDIT HASH
 # =========================
 def hash_block(prev_hash, data):
     return hashlib.sha256(f"{prev_hash}|{data}".encode()).hexdigest()
@@ -209,7 +206,7 @@ async def analyze_request(
     }
 
 # =========================
-# HEALTH CHECK
+# HEALTH + AUDIT CHECK
 # =========================
 @app.get("/")
 def root():
