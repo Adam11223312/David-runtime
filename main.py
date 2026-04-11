@@ -1,25 +1,25 @@
-from fastapi import FastAPI, Request, Header, HTTPException, Depends
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Request, Header, HTTPException
+from pydantic import BaseModel
 import time
 import hashlib
 import uuid
 import sqlite3
 import jwt
-from typing import Dict, Any, Optional
+from collections import defaultdict
+
+app = FastAPI(title="David Core - Stable Production Build")
 
 # =========================
 # CONFIG
 # =========================
-APP_NAME = "David Core AI - Production Grade"
 JWT_SECRET = "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET"
 JWT_ALG = "HS256"
-RATE_LIMIT = 60  # per minute per IP
+
+RATE_LIMIT = 60  # per minute
 BLOCK_TIME = 60  # seconds
 
-app = FastAPI(title=APP_NAME)
-
 # =========================
-# DATABASE (AUDIT PERSISTENCE)
+# DATABASE (AUDIT CHAIN)
 # =========================
 conn = sqlite3.connect("david_audit.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -41,26 +41,26 @@ conn.commit()
 # =========================
 # MEMORY STATE
 # =========================
-rate_tracker = {}
+rate_tracker = defaultdict(list)
 blocked_ips = {}
 used_nonces = set()
-last_hash = "GENESIS_DAVID_CORE"
+last_hash = "GENESIS_DAVID"
 
 # =========================
 # INPUT MODEL
 # =========================
 class Payload(BaseModel):
-    payload: Dict[str, Any] = Field(...)
+    payload: dict
 
 # =========================
-# AUTH (JWT)
+# AUTH
 # =========================
-def verify_token(auth: str):
-    if not auth:
+def verify_token(auth_header: str):
+    if not auth_header:
         raise HTTPException(status_code=401, detail="Missing token")
 
     try:
-        token = auth.replace("Bearer ", "")
+        token = auth_header.replace("Bearer ", "")
         jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -82,51 +82,53 @@ def verify_nonce(nonce: str):
 # =========================
 def rate_limit(ip: str):
     now = time.time()
-    bucket = rate_tracker.get(ip, [])
 
-    bucket = [t for t in bucket if now - t < 60]
-    bucket.append(now)
+    if ip in blocked_ips:
+        if now < blocked_ips[ip]:
+            raise HTTPException(status_code=403, detail="IP temporarily blocked")
+        else:
+            del blocked_ips[ip]
 
-    rate_tracker[ip] = bucket
+    window = rate_tracker[ip]
 
-    if len(bucket) > RATE_LIMIT:
+    # remove old requests
+    rate_tracker[ip] = [t for t in window if now - t < 60]
+
+    rate_tracker[ip].append(now)
+
+    if len(rate_tracker[ip]) > RATE_LIMIT:
         blocked_ips[ip] = now + BLOCK_TIME
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
-
-    if ip in blocked_ips and now < blocked_ips[ip]:
-        raise HTTPException(status_code=403, detail="IP temporarily blocked")
 
 # =========================
 # RISK ENGINE
 # =========================
-def analyze(payload: dict, ip: str):
+def analyze_payload(payload: dict):
     risk = 0.0
     reasons = []
 
-    payload_str = str(payload)
+    text = str(payload)
 
-    # Unknown structure heuristic
-    if len(payload_str) > 600:
+    # size check
+    if len(text) > 600:
         risk += 0.25
         reasons.append("Large payload")
 
-    # Deep nesting detection
-    def depth(d, level=0):
-        if not isinstance(d, dict):
-            return level
-        return max([depth(v, level + 1) for v in d.values()] + [level])
+    # suspicious keywords
+    if "exec" in text.lower() or "eval" in text.lower():
+        risk += 0.5
+        reasons.append("Suspicious keyword detected")
 
-    d = depth(payload)
-    if d > 3:
+    # nesting check
+    def depth(d):
+        if not isinstance(d, dict):
+            return 0
+        return 1 + max([depth(v) for v in d.values()] or [0])
+
+    if depth(payload) > 3:
         risk += 0.3
         reasons.append("Deep nesting detected")
 
-    # Random anomaly heuristic
-    if "exec" in payload_str.lower() or "eval" in payload_str.lower():
-        risk += 0.5
-        reasons.append("Suspicious keywords detected")
-
-    # Clamp
     risk = max(0.0, min(1.0, risk))
 
     if risk >= 0.75:
@@ -139,7 +141,7 @@ def analyze(payload: dict, ip: str):
     return decision, risk, reasons
 
 # =========================
-# HASH CHAIN (AUDIT)
+# AUDIT HASH CHAIN
 # =========================
 def hash_block(prev_hash, data):
     raw = f"{prev_hash}|{data}"
@@ -169,28 +171,27 @@ def write_audit(ip, decision, risk, reasons):
     conn.commit()
 
     last_hash = current_hash
-
     return current_hash
 
 # =========================
-# RESPONSE ENGINE
+# RESPONSE FORMAT
 # =========================
 def message(decision):
     if decision == "allow":
-        return "Request accepted."
+        return "Request accepted"
     if decision == "flag":
-        return "Request flagged for review."
-    return "Request blocked by security policy."
+        return "Request flagged"
+    return "Request blocked"
 
 # =========================
 # MAIN ENDPOINT
 # =========================
 @app.post("/analyze")
-async def analyze_request(
+async def analyze(
     request: Request,
     data: Payload,
-    authorization: Optional[str] = Header(None),
-    x_nonce: Optional[str] = Header(None)
+    authorization: str = Header(None),
+    x_nonce: str = Header(None)
 ):
     start = time.time()
     ip = request.client.host
@@ -200,13 +201,11 @@ async def analyze_request(
     verify_nonce(x_nonce)
     rate_limit(ip)
 
-    # CORE ANALYSIS
-    decision, risk, reasons = analyze(data.payload, ip)
+    # CORE LOGIC
+    decision, risk, reasons = analyze_payload(data.payload)
 
-    # AUDIT LOGGING
+    # AUDIT
     audit_hash = write_audit(ip, decision, risk, reasons)
-
-    latency = round(time.time() - start, 4)
 
     return {
         "message": message(decision),
@@ -214,11 +213,11 @@ async def analyze_request(
         "risk_score": risk,
         "reasons": reasons,
         "audit_hash": audit_hash,
-        "latency": latency
+        "latency": round(time.time() - start, 4)
     }
 
 # =========================
-# AUDIT VERIFY ENDPOINT
+# VERIFY AUDIT CHAIN
 # =========================
 @app.get("/audit/verify")
 def verify():
@@ -227,6 +226,5 @@ def verify():
 
     return {
         "audit_records": count,
-        "status": "active",
-        "integrity": "append-only"
+        "status": "ok"
     }
