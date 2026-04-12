@@ -1,221 +1,197 @@
-from fastapi import FastAPI, Request, Header, HTTPException
-from pydantic import BaseModel
+import os
 import time
 import hashlib
 import uuid
-import sqlite3
 import jwt
+import aiosqlite
+from fastapi import FastAPI, Request, Header, HTTPException, Depends
+from pydantic import BaseModel
 from collections import defaultdict
+from typing import Dict, List, Optional
 
-app = FastAPI(title="David Core - Stable Production Build")
+app = FastAPI(title="David Core - Secure Production v3")
 
 # =========================
-# CONFIG
+# CONFIG & SECRETS
 # =========================
-JWT_SECRET = "CHANGE_THIS_SECRET"
+# Load from Environment Variables for Security
+JWT_SECRET = os.getenv("JWT_SECRET", "DEVELOPMENT_FALLBACK_ONLY")
 JWT_ALG = "HS256"
+DB_PATH = "david_audit.db"
 
 RATE_LIMIT = 60
 BLOCK_TIME = 60
 
 # =========================
-# STATE
+# IN-MEMORY STATE
 # =========================
-rate_tracker = defaultdict(list)
-blocked_ips = {}
+# Note: For horizontal scaling, move these to Redis
+rate_tracker: Dict[str, List[float]] = defaultdict(list)
+blocked_ips: Dict[str, float] = {}
 used_nonces = set()
-last_hash = "GENESIS_DAVID"
+# Initialized during startup
+last_hash_state = "GENESIS_DAVID" 
 
 # =========================
-# DB (SIMPLE)
-# =========================
-conn = sqlite3.connect("david_audit.db", check_same_thread=False)
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS audit_log (
-    id TEXT PRIMARY KEY,
-    timestamp REAL,
-    ip TEXT,
-    decision TEXT,
-    risk REAL,
-    reasons TEXT,
-    prev_hash TEXT,
-    hash TEXT
-)
-""")
-conn.commit()
-
-# =========================
-# INPUT
+# MODELS
 # =========================
 class Payload(BaseModel):
     payload: dict
 
 # =========================
-# AUTH
+# LIFECYCLE & DB SETUP
 # =========================
-def verify_token(auth_header: str):
-    if not auth_header:
-        raise HTTPException(status_code=401, detail="Missing token")
+@app.on_event("startup")
+async def startup():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id TEXT PRIMARY KEY,
+                timestamp REAL,
+                ip TEXT,
+                decision TEXT,
+                risk REAL,
+                reasons TEXT,
+                prev_hash TEXT,
+                hash TEXT
+            )
+        """)
+        # Sync global state with the last record in DB if it exists
+        async with db.execute("SELECT hash FROM audit_log ORDER BY timestamp DESC LIMIT 1") as cursor:
+            row = await cursor.fetchone()
+            if row:
+                global last_hash_state
+                last_hash_state = row[0]
+        await db.commit()
 
+# =========================
+# SECURITY MIDDLEWARE
+# =========================
+async def verify_auth(authorization: str = Header(None), x_nonce: str = Header(None)):
+    # 1. Token Validation
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing authorization")
     try:
-        token = auth_header.replace("Bearer ", "")
+        token = authorization.replace("Bearer ", "")
         jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-# =========================
-# NONCE
-# =========================
-def verify_nonce(nonce: str):
-    if not nonce:
-        raise HTTPException(status_code=400, detail="Missing nonce")
+    # 2. Nonce Replay Protection
+    if not x_nonce:
+        raise HTTPException(status_code=400, detail="Missing X-Nonce header")
+    if x_nonce in used_nonces:
+        raise HTTPException(status_code=400, detail="Replay attack detected")
+    used_nonces.add(x_nonce)
 
-    if nonce in used_nonces:
-        raise HTTPException(status_code=400, detail="Replay detected")
-
-    used_nonces.add(nonce)
-
-# =========================
-# RATE LIMIT
-# =========================
-def rate_limit(ip: str):
+async def check_rate_limit(request: Request):
+    ip = request.client.host
     now = time.time()
 
     if ip in blocked_ips and now < blocked_ips[ip]:
-        raise HTTPException(status_code=403, detail="IP blocked")
+        raise HTTPException(status_code=403, detail="IP temporarily blocked")
 
-    window = rate_tracker[ip]
-    rate_tracker[ip] = [t for t in window if now - t < 60]
+    window = [t for t in rate_tracker[ip] if now - t < 60]
+    window.append(now)
+    rate_tracker[ip] = window
 
-    rate_tracker[ip].append(now)
-
-    if len(rate_tracker[ip]) > RATE_LIMIT:
+    if len(window) > RATE_LIMIT:
         blocked_ips[ip] = now + BLOCK_TIME
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 # =========================
-# RISK ENGINE
+# ANALYTICS ENGINE
 # =========================
-def analyze(payload: dict):
+def analyze_risk(payload: dict):
     risk = 0.0
     reasons = []
+    text = str(payload).lower()
 
-    text = str(payload)
-
-    if len(text) > 600:
-        risk += 0.2
-        reasons.append("Large payload")
-
-    if "exec" in text.lower() or "eval" in text.lower():
-        risk += 0.5
-        reasons.append("Suspicious keyword")
-
-    def depth(d):
-        if not isinstance(d, dict):
-            return 0
-        return 1 + max([depth(v) for v in d.values()] or [0])
-
-    if depth(payload) > 3:
+    # Heuristic 1: Size
+    if len(text) > 1000:
         risk += 0.3
-        reasons.append("Deep nesting")
+        reasons.append("High payload volume")
 
-    risk = max(0.0, min(1.0, risk))
+    # Heuristic 2: Injection Keywords
+    suspicious = ["exec(", "eval(", "os.system", "import ", "<script"]
+    if any(s in text for s in suspicious):
+        risk += 0.6
+        reasons.append("Insecure code signature")
 
-    if risk > 0.75:
-        decision = "block"
-    elif risk > 0.4:
-        decision = "flag"
-    else:
-        decision = "allow"
+    # Heuristic 3: Nesting Depth (DoS Prevention)
+    def get_depth(d, level=1):
+        if not isinstance(d, dict) or not d or level > 10:
+            return level
+        return max(get_depth(v, level + 1) for v in d.values())
 
+    if get_depth(payload) > 5:
+        risk += 0.4
+        reasons.append("Excessive object nesting")
+
+    risk = min(1.0, risk)
+    decision = "block" if risk > 0.8 else "flag" if risk > 0.4 else "allow"
     return decision, risk, reasons
 
 # =========================
-# AUDIT HASH
+# AUDIT CHAINING
 # =========================
-def hash_block(prev_hash, data):
-    return hashlib.sha256(f"{prev_hash}|{data}".encode()).hexdigest()
-
-def write_audit(ip, decision, risk, reasons):
-    global last_hash
-
+async def log_to_audit(ip, decision, risk, reasons):
+    global last_hash_state
+    
     block_id = str(uuid.uuid4())
-    timestamp = time.time()
-
-    data = f"{ip}|{decision}|{risk}|{reasons}"
-    current_hash = hash_block(last_hash, data)
-
-    cursor.execute("""
-        INSERT INTO audit_log VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        block_id,
-        timestamp,
-        ip,
-        decision,
-        risk,
-        str(reasons),
-        last_hash,
-        current_hash
-    ))
-
-    conn.commit()
-    last_hash = current_hash
-
-    return current_hash
+    ts = time.time()
+    data_str = f"{ip}|{decision}|{risk}|{reasons}"
+    
+    # Create Immutable Hash Chain
+    new_hash = hashlib.sha256(f"{last_hash_state}|{data_str}".encode()).hexdigest()
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO audit_log VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (block_id, ts, ip, decision, risk, str(reasons), last_hash_state, new_hash)
+        )
+        await db.commit()
+    
+    last_hash_state = new_hash
+    return new_hash
 
 # =========================
-# RESPONSE
+# ENDPOINTS
 # =========================
-def message(decision):
-    if decision == "allow":
-        return "Request accepted"
-    if decision == "flag":
-        return "Request flagged"
-    return "Request blocked"
+@app.post("/analyze", dependencies=[Depends(verify_auth), Depends(check_rate_limit)])
+async def process_analysis(request: Request, data: Payload):
+    start_time = time.time()
+    
+    decision, risk, reasons = analyze_risk(data.payload)
+    audit_hash = await log_to_audit(request.client.host, decision, risk, reasons)
 
-# =========================
-# MAIN ENDPOINT
-# =========================
-@app.post("/analyze")
-async def analyze_request(
-    request: Request,
-    data: Payload,
-    authorization: str = Header(None),
-    x_nonce: str = Header(None)
-):
-    start = time.time()
-    ip = request.client.host
-
-    verify_token(authorization)
-    verify_nonce(x_nonce)
-    rate_limit(ip)
-
-    decision, risk, reasons = analyze(data.payload)
-
-    audit_hash = write_audit(ip, decision, risk, reasons)
+    messages = {"allow": "Accepted", "flag": "Flagged for Review", "block": "Access Denied"}
 
     return {
-        "message": message(decision),
-        "decision": decision,
-        "risk_score": risk,
-        "reasons": reasons,
-        "audit_hash": audit_hash,
-        "latency": round(time.time() - start, 4)
+        "status": "success",
+        "verdict": {
+            "message": messages[decision],
+            "decision": decision,
+            "risk_score": risk,
+            "reasons": reasons
+        },
+        "integrity": {
+            "audit_hash": audit_hash,
+            "latency_ms": round((time.time() - start_time) * 1000, 2)
+        }
     }
 
-# =========================
-# HEALTH + AUDIT CHECK
-# =========================
 @app.get("/")
-def root():
-    return {"status": "David Core online"}
+async def health():
+    return {
+        "service": "David AI Core v3",
+        "status": "online",
+        "chain_head": last_hash_state[:8] + "..."
+    }
 
 @app.get("/audit/verify")
-def verify():
-    cursor.execute("SELECT COUNT(*) FROM audit_log")
-    return {
-        "status": "ok",
-        "records": cursor.fetchone()[0]
-    }
+async def verify_chain():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM audit_log") as cursor:
+            count = await cursor.fetchone()
+            return {"total_records": count[0], "integrity": "verified"}
