@@ -1,4 +1,4 @@
-import hashlib
+mport hashlib
 import time
 import json
 import uuid
@@ -117,3 +117,4 @@ if __name__ == "__main__":
     car.verify_integrity()
     
     print("\n--- FINAL AUDIT LOG PREVIEW ---")
+    print(json.dumps(car.audit_chain[-1], indent=2))
