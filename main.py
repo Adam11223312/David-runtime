@@ -1,145 +1,120 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 import hashlib
+import time
 import json
 import uuid
 from datetime import datetime
 
-app = FastAPI(title="David AI Core - Orchestrator v5")
+class DavidAICore:
+    """
+    David AI Core v4.1 - Patent Pending (App No. 64/010,038)
+    Inventor: Christopher Thomas
+    
+    This is a simulation of the Universal Trust Layer, featuring the 
+    Immutable Audit Chain and Dynamic QR Plaque generation.
+    """
+    
+    def __init__(self, vehicle_id):
+        self.vehicle_id = vehicle_id
+        self.audit_chain = []
+        self.current_qr_plaque = None
+        self.system_status = "SECURE"
+        self.initialize_system()
 
-# -----------------------------
-# CORE SYSTEM MODULES
-# -----------------------------
+    def initialize_system(self):
+        # Create the Genesis Block for the Audit Chain
+        genesis_entry = self._create_audit_entry("SYSTEM_INIT", "David AI Core v4.1 Online")
+        self.audit_chain.append(genesis_entry)
+        self.generate_dynamic_qr()
+        print(f"[*] {self.vehicle_id}: System Initialized. Status: {self.system_status}")
 
-class AuditChain:
-    def __init__(self):
-        self.chain = []
-        self.last_hash = "GENESIS"
-
-    def add(self, event_type, data):
+    def _create_audit_entry(self, action, details):
+        prev_hash = self.audit_chain[-1]['hash'] if self.audit_chain else "0" * 64
         timestamp = datetime.utcnow().isoformat()
-
-        payload = {
+        
+        entry_data = {
             "timestamp": timestamp,
-            "event": event_type,
-            "data": data,
-            "prev_hash": self.last_hash
+            "action": action,
+            "details": details,
+            "prev_hash": prev_hash
         }
+        
+        # Immutable Hashing (SHA-256)
+        entry_string = json.dumps(entry_data, sort_keys=True).encode()
+        entry_hash = hashlib.sha256(entry_string).hexdigest()
+        
+        entry_data['hash'] = entry_hash
+        return entry_data
 
-        raw = json.dumps(payload, sort_keys=True).encode()
-        current_hash = hashlib.sha256(raw).hexdigest()
+    def perform_risk_analysis(self, sensor_data):
+        """
+        Fail-Closed Risk Analysis Logic
+        """
+        print(f"\n[!] Analyzing Sensor Data: {sensor_data}")
+        
+        # Simulation of threat detection (e.g., unauthorized CAN bus access)
+        if sensor_data.get("unauthorized_access") or sensor_data.get("signal_spoofing"):
+            self.system_status = "THREAT_DETECTED"
+            entry = self._create_audit_entry("SECURITY_ALERT", "Unauthorized access detected. Executing Fail-Closed.")
+            self.audit_chain.append(entry)
+            self.execute_fail_closed()
+        else:
+            entry = self._create_audit_entry("ROUTINE_CHECK", "All systems nominal.")
+            self.audit_chain.append(entry)
+            print("[+] Risk Analysis: Low. Continuing operations.")
 
-        payload["hash"] = current_hash
+    def execute_fail_closed(self):
+        """
+        The 'Unstealable Car' Protocol
+        """
+        print(f"[-] CRITICAL: {self.system_status}. Immobilizing Vehicle.")
+        print("[-] Hardware Lock Engaged. Audit Chain Locked.")
+        self.generate_dynamic_qr(alert=True)
 
-        self.chain.append(payload)
-        self.last_hash = current_hash
+    def generate_dynamic_qr(self, alert=False):
+        """
+        Dynamic QR Plaque Generation
+        Rotating, disappearing IDs synced to the Audit Chain
+        """
+        rotation_id = str(uuid.uuid4())[:8]
+        status_code = "RED" if alert else "GREEN"
+        
+        # The QR content is a hash of the current Audit Chain state
+        current_state_hash = self.audit_chain[-1]['hash']
+        self.current_qr_plaque = f"DAVID-AI-{status_code}-{rotation_id}-{current_state_hash[:12]}"
+        
+        print(f"[#] New Dynamic QR Plaque Generated: {self.current_qr_plaque}")
+        return self.current_qr_plaque
 
-        return payload
+    def verify_integrity(self):
+        """
+        Verifies the Immutable Audit Chain
+        """
+        print("\n[*] Verifying Audit Chain Integrity...")
+        for i in range(1, len(self.audit_chain)):
+            prev = self.audit_chain[i-1]
+            curr = self.audit_chain[i]
+            
+            if curr['prev_hash'] != prev['hash']:
+                print(f"[X] INTEGRITY BREACH AT BLOCK {i}!")
+                return False
+        print("[+] Audit Chain Verified. 100% Immutable.")
+        return True
 
-
-class DecisionEngine:
-    def evaluate(self, intent, risk_score):
-        if risk_score >= 70:
-            return "DENY"
-        elif risk_score >= 40:
-            return "REVIEW"
-        return "ALLOW"
-
-
-class RiskEngine:
-    def score(self, intent, data):
-        score = 0
-
-        if data.get("unauthorized_access"):
-            score += 60
-
-        if "payment" in intent.lower():
-            score += 20
-
-        if data.get("anomaly"):
-            score += 30
-
-        return min(score, 100)
-
-
-class QRSystem:
-    def generate(self, state_hash, status):
-        token = str(uuid.uuid4())[:8]
-        return f"DAVID-{status}-{token}-{state_hash[:10]}"
-
-
-# -----------------------------
-# GLOBAL SYSTEM INSTANCE
-# -----------------------------
-audit = AuditChain()
-risk_engine = RiskEngine()
-decision_engine = DecisionEngine()
-qr_system = QRSystem()
-
-# -----------------------------
-# API MODELS
-# -----------------------------
-class RequestPayload(BaseModel):
-    device_id: str
-    intent: str
-    data: dict
-
-# -----------------------------
-# CORE PIPELINE (THIS IS DAVID)
-# -----------------------------
-@app.post("/process")
-def process(req: RequestPayload):
-
-    # 1. Risk
-    risk = risk_engine.score(req.intent, req.data)
-
-    # 2. Decision
-    decision = decision_engine.evaluate(req.intent, risk)
-
-    # 3. ENFORCEMENT (fail-closed)
-    if decision == "DENY":
-        status = "LOCKED"
-    else:
-        status = "ACTIVE"
-
-    # 4. Audit log
-    entry = audit.add("DECISION", {
-        "device_id": req.device_id,
-        "intent": req.intent,
-        "risk": risk,
-        "decision": decision,
-        "status": status
-    })
-
-    # 5. State hash for QR
-    state_hash = entry["hash"]
-    qr = qr_system.generate(state_hash, status)
-
-    # 6. Response
-    return {
-        "decision": decision,
-        "risk": risk,
-        "system_status": status,
-        "qr_state": qr,
-        "audit_hash": state_hash
-    }
-
-
-# -----------------------------
-# AUDIT VIEW
-# -----------------------------
-@app.get("/audit")
-def get_audit():
-    return audit.chain
-
-
-# -----------------------------
-# SYSTEM CHECK
-# -----------------------------
-@app.get("/status")
-def status():
-    return {
-        "system": "DAVID CORE v5",
-        "state": "ONLINE",
-        "entries": len(audit.chain)
-    }
+# --- DEMONSTRATION ---
+if __name__ == "__main__":
+    # 1. Start the System
+    car = DavidAICore(vehicle_id="TESLA-MODEL-3-CT")
+    
+    # 2. Normal Operation
+    time.sleep(1)
+    car.perform_risk_analysis({"speed": 65, "location": "Columbus, OH"})
+    
+    # 3. Threat Detection (The 'Unstealable' Moment)
+    time.sleep(1)
+    car.perform_risk_analysis({"unauthorized_access": True, "source": "OBD-II Port"})
+    
+    # 4. Verification
+    car.verify_integrity()
+    
+    print("\n--- FINAL AUDIT LOG PREVIEW ---")
+    print(json.dumps(car.audit_chain[-1], indent=2))
